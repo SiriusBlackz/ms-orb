@@ -1,0 +1,13 @@
+# MS-ORB Trading Bot Dependencies
+
+# OANDA v20 REST API client
+oandapyV20>=0.7.2
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Timezone handling
+pytz>=2024.1
+
+# For type hints (Python 3.9+)
+typing-extensions>=4.0.0

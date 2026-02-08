@@ -1,0 +1,20 @@
+# Environment / secrets
+.env
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Database
+*.db
+
+# Logs
+logs/
+
+# IDE
+.vscode/
+.idea/

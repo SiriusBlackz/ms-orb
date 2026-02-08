@@ -1,0 +1,10 @@
+# MS-ORB IBKR Trading Bot Dependencies
+
+# Interactive Brokers API wrapper
+ib_insync>=0.9.86
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Timezone handling
+pytz>=2024.1
