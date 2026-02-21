@@ -79,7 +79,7 @@ class TradingConfig:
 
     # IBKR connection configuration
     IBKR_HOST: str = os.getenv("IBKR_HOST", "127.0.0.1")
-    IBKR_PORT: int = int(os.getenv("IBKR_PORT", "7497"))  # 7497=TWS paper, 7496=TWS live, 4002=GW paper, 4001=GW live
+    IBKR_PORT: int = int(os.getenv("IBKR_PORT", "4002"))  # 4002=GW paper, 4001=GW live, 7497=TWS paper, 7496=TWS live
     IBKR_CLIENT_ID: int = int(os.getenv("IBKR_CLIENT_ID", "1"))
 
     @classmethod

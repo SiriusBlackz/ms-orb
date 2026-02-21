@@ -85,6 +85,10 @@ class IBKRClient:
         # Cache the TSLA contract
         self._contracts: dict[str, Contract] = {}
 
+        # Register event handlers for disconnect/error detection
+        self.ib.disconnectedEvent += self._on_disconnect
+        self.ib.errorEvent += self._on_error
+
     def connect(self) -> bool:
         """Connect to TWS/Gateway.
 
@@ -107,6 +111,58 @@ class IBKRClient:
         except Exception as e:
             logger.error(f"IBKR connection failed: {e}")
             return False
+
+    def _on_disconnect(self):
+        """Handle disconnect event from ib_insync."""
+        self._connected = False
+        logger.warning("IBKR disconnected event received")
+
+    def _on_error(self, reqId, errorCode, errorString, contract):
+        """Handle IB error events for connectivity issues."""
+        if errorCode == 1100:
+            logger.warning(f"IB connectivity lost: {errorString}")
+        elif errorCode == 1102:
+            logger.info(f"IB connectivity restored: {errorString}")
+        elif errorCode == 504:
+            logger.error(f"Not connected to TWS/Gateway: {errorString}")
+
+    def reconnect(self) -> bool:
+        """Reconnect to IBKR with exponential backoff.
+
+        Returns:
+            True if reconnection successful, False after all attempts exhausted.
+        """
+        max_attempts = 50
+        base_delay = 5
+        max_delay = 300
+
+        for attempt in range(1, max_attempts + 1):
+            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+            logger.warning(
+                f"Reconnect attempt {attempt}/{max_attempts}, waiting {delay}s..."
+            )
+
+            try:
+                self.ib.disconnect()
+            except Exception:
+                pass
+
+            self.ib.sleep(delay)
+
+            try:
+                self.ib.connect(
+                    self.host, self.port,
+                    clientId=self.client_id, timeout=20,
+                )
+                self._connected = True
+                self._contracts = {}  # Force re-qualification after reconnect
+                logger.info(f"Reconnected to IBKR on attempt {attempt}")
+                return True
+            except Exception as e:
+                logger.error(f"Reconnect attempt {attempt} failed: {e}")
+
+        logger.critical(f"Failed to reconnect after {max_attempts} attempts")
+        return False
 
     def disconnect(self) -> None:
         """Disconnect from TWS/Gateway."""

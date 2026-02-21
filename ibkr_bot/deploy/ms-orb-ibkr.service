@@ -1,0 +1,34 @@
+[Unit]
+Description=MS-ORB IBKR Trading Bot (TSLA)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=msorbbot
+Group=msorbbot
+WorkingDirectory=/opt/ms-orb-ibkr
+EnvironmentFile=/opt/ms-orb-ibkr/.env
+
+ExecStart=/opt/ms-orb-ibkr/venv/bin/python3 main.py
+
+# Logging
+StandardOutput=append:/var/log/ms-orb-ibkr.log
+StandardError=append:/var/log/ms-orb-ibkr.log
+
+# Always restart (disconnects aren't crashes but still need restart)
+Restart=always
+RestartSec=10
+
+# Safety limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ms-orb-ibkr /var/log/ms-orb-ibkr.log
+
+[Install]
+WantedBy=multi-user.target

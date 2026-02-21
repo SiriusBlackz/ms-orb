@@ -1,0 +1,28 @@
+# IB Gateway Docker container for headless VPS operation.
+# Handles: login, 2FA auto-restart, daily Gateway restart.
+# Image docs: https://github.com/gnzsnz/ib-gateway-docker
+#
+# Usage:
+#   cp .env.example .env   # fill in credentials
+#   docker compose up -d
+#   docker compose logs -f  # check startup
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: always
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+      READ_ONLY_API: "no"
+      TWOFA_TIMEOUT_ACTION: restart
+      AUTO_RESTART_TIME: "11:59 PM"
+      RELOGIN_AFTER_2FA_TIMEOUT: "yes"
+    volumes:
+      - ./tws_settings:/home/ibgateway/tws_settings
+    ports:
+      - "127.0.0.1:4001:4003"  # Live API (internal 4003 -> host 4001)
+      - "127.0.0.1:4002:4004"  # Paper API (internal 4004 -> host 4002)
+      - "127.0.0.1:5900:5900"  # VNC for debugging

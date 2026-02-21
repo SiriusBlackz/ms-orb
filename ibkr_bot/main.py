@@ -405,11 +405,12 @@ class TradingBot:
                 try:
                     # Check connection
                     if not self.client.is_connected():
-                        logger.warning("IBKR disconnected, reconnecting...")
-                        if not self.client.connect():
-                            logger.error("Reconnection failed, waiting...")
-                            time.sleep(30)
-                            continue
+                        logger.warning("IBKR disconnected, attempting reconnect...")
+                        if not self.client.reconnect():
+                            logger.critical("All reconnect attempts exhausted, shutting down")
+                            break
+                        # Re-check position state after reconnect (may have filled/closed while disconnected)
+                        self._check_position()
 
                     # Process candles
                     self._process_candles()
@@ -473,7 +474,7 @@ def main():
     parser.add_argument(
         "--port",
         type=int,
-        help="IBKR port override (7497=TWS paper, 7496=TWS live)",
+        help="IBKR port override (4002=GW paper, 4001=GW live, 7497=TWS paper, 7496=TWS live)",
     )
     args = parser.parse_args()
 
