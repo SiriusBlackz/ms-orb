@@ -250,8 +250,17 @@ class TradingBot:
                     f"Price: {exit_price:.2f} Reason: {exit_reason} "
                     f"PnL: ${pnl:.2f} RR: {rr:.2f}"
                 )
+            else:
+                logger.warning(
+                    f"Could not determine exit price for {self.instrument}, "
+                    f"using entry price as fallback"
+                )
+                exit_price = pos_info["entry_price"]
+                exit_reason = "unknown"
 
-                self.session_manager.handle_trade_exit(exit_reason, exit_price)
+            # Always notify session manager so it can transition
+            # back to WATCHING_FOR_BREAKOUT for re-entry
+            self.session_manager.handle_trade_exit(exit_reason, exit_price)
 
             self._open_position = None
 

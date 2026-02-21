@@ -436,6 +436,94 @@ class OANDAClient:
             logger.error(f"Order failed for {instrument}: {e}")
             return OrderResult(success=False, error=str(e))
 
+    def place_limit_order(
+        self,
+        instrument: str,
+        units: int,
+        price: float,
+        stop_loss: float,
+        take_profit: float,
+        gtd_time: Optional[str] = None,
+    ) -> OrderResult:
+        """Place a limit order with stop loss and take profit.
+
+        Args:
+            instrument: Instrument name.
+            units: Number of units (positive for long, negative for short).
+            price: Limit price to enter at.
+            stop_loss: Stop loss price.
+            take_profit: Take profit price.
+            gtd_time: Optional GTD expiry time in RFC3339 format.
+                       If None, uses GTC (Good Till Cancelled).
+
+        Returns:
+            OrderResult with order details or error.
+        """
+        try:
+            config = INSTRUMENT_CONFIG.get(instrument, {})
+            pip_location = config.get("pip_location", -4)
+            precision = abs(pip_location) + 1
+
+            order_data = {
+                "type": "LIMIT",
+                "instrument": instrument,
+                "units": str(units),
+                "price": f"{price:.{precision}f}",
+                "timeInForce": "GTD" if gtd_time else "GTC",
+                "stopLossOnFill": {
+                    "price": f"{stop_loss:.{precision}f}",
+                },
+                "takeProfitOnFill": {
+                    "price": f"{take_profit:.{precision}f}",
+                },
+                "triggerCondition": "DEFAULT",
+            }
+
+            if gtd_time:
+                order_data["gtdTime"] = gtd_time
+
+            data = {"order": order_data}
+
+            r = orders.OrderCreate(self.account_id, data=data)
+            self.api.request(r)
+
+            response = r.response
+
+            # Limit order may fill immediately if price is already at limit
+            if "orderFillTransaction" in response:
+                fill = response["orderFillTransaction"]
+                return OrderResult(
+                    success=True,
+                    order_id=fill.get("orderID"),
+                    trade_id=fill.get("tradeOpened", {}).get("tradeID"),
+                    fill_price=float(fill.get("price", 0)),
+                    units=int(fill.get("units", 0)),
+                )
+            elif "orderCreateTransaction" in response:
+                create = response["orderCreateTransaction"]
+                return OrderResult(
+                    success=True,
+                    order_id=create.get("id"),
+                )
+            elif "orderCancelTransaction" in response:
+                cancel = response["orderCancelTransaction"]
+                return OrderResult(
+                    success=False,
+                    error=cancel.get("reason", "Order cancelled"),
+                )
+            else:
+                return OrderResult(
+                    success=False,
+                    error="Unknown order response",
+                )
+
+        except oandapyV20.exceptions.V20Error as e:
+            logger.error(f"Limit order failed for {instrument}: {e}")
+            return OrderResult(success=False, error=str(e))
+        except Exception as e:
+            logger.error(f"Limit order failed for {instrument}: {e}")
+            return OrderResult(success=False, error=str(e))
+
     def close_position(self, instrument: str) -> OrderResult:
         """Close all positions for an instrument.
 

@@ -142,18 +142,25 @@ class TradingBot:
             units = -units
 
         # Place order
-        result = self.client.place_market_order(
+        result = self.client.place_limit_order(
             instrument=instrument,
             units=units,
+            price=signal.entry_price,
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
         )
 
         if result.success:
-            logger.info(
-                f"ORDER FILLED | {instrument} | {result.units} units @ {result.fill_price} "
-                f"| Trade ID: {result.trade_id}"
-            )
+            if result.fill_price:
+                logger.info(
+                    f"LIMIT ORDER FILLED | {instrument} | {result.units} units @ {result.fill_price} "
+                    f"| Trade ID: {result.trade_id}"
+                )
+            else:
+                logger.info(
+                    f"LIMIT ORDER PLACED | {instrument} | {units} units @ {signal.entry_price:.5f} "
+                    f"| Order ID: {result.order_id}"
+                )
 
             # Log to database
             db_id = self.trade_logger.log_entry(
@@ -283,10 +290,18 @@ class TradingBot:
                         f"Price: {exit_price:.5f} Reason: {exit_reason} "
                         f"PnL: {pnl:.2f} RR: {rr:.2f}"
                     )
+                else:
+                    logger.warning(
+                        f"Could not determine exit price for {instrument}, "
+                        f"using entry price as fallback"
+                    )
+                    exit_price = pos["entry_price"]
+                    exit_reason = "unknown"
 
-                    # Notify session manager
-                    sm = self.session_managers[instrument]
-                    sm.handle_trade_exit(pos["session"], exit_reason, exit_price)
+                # Always notify session manager so it can transition
+                # back to WATCHING_FOR_BREAKOUT for re-entry
+                sm = self.session_managers[instrument]
+                sm.handle_trade_exit(pos["session"], exit_reason, exit_price)
 
                 # Clean up
                 del self._open_positions[instrument]
