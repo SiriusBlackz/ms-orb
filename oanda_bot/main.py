@@ -90,8 +90,9 @@ class TradingBot:
                 on_trade_closed=lambda rec, inst=instrument: self._on_trade_closed(rec, inst),
             )
 
-        # Track open positions
+        # Track open positions and pending orders
         self._open_positions: dict[str, dict] = {}  # instrument -> position info
+        self._pending_orders: dict[str, dict] = {}  # instrument -> pending order info
         self._db_trade_ids: dict[str, int] = {}  # oanda_trade_id -> db_row_id
         self._last_candle_times: dict[str, datetime] = {}  # instrument -> last candle time
 
@@ -151,52 +152,81 @@ class TradingBot:
         )
 
         if result.success:
-            if result.fill_price:
+            sm = self.session_managers[instrument]
+
+            if result.fill_price and result.trade_id:
+                # Limit order filled immediately
                 logger.info(
                     f"LIMIT ORDER FILLED | {instrument} | {result.units} units @ {result.fill_price} "
                     f"| Trade ID: {result.trade_id}"
                 )
+
+                # Log to database
+                db_id = self.trade_logger.log_entry(
+                    instrument=instrument,
+                    session=signal.session,
+                    direction=signal.direction,
+                    entry_price=result.fill_price,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit,
+                    units=abs(result.units or units),
+                    trade_id=result.trade_id,
+                    opening_range_high=signal.opening_range.high,
+                    opening_range_low=signal.opening_range.low,
+                )
+
+                # Track position
+                self._open_positions[instrument] = {
+                    "trade_id": result.trade_id,
+                    "db_id": db_id,
+                    "session": signal.session,
+                    "direction": signal.direction,
+                    "entry_price": result.fill_price,
+                    "stop_loss": signal.stop_loss,
+                    "take_profit": signal.take_profit,
+                    "units": abs(result.units or units),
+                }
+                self._db_trade_ids[result.trade_id] = db_id
+
+                # Transition directly to IN_TRADE (skip PENDING_ORDER)
+                sm.confirm_order_filled(signal.session, result.trade_id, result.fill_price)
+
             else:
+                # Limit order pending — track order ID for monitoring
                 logger.info(
                     f"LIMIT ORDER PLACED | {instrument} | {units} units @ {signal.entry_price:.5f} "
                     f"| Order ID: {result.order_id}"
                 )
 
-            # Log to database
-            db_id = self.trade_logger.log_entry(
-                instrument=instrument,
-                session=signal.session,
-                direction=signal.direction,
-                entry_price=result.fill_price or signal.entry_price,
-                stop_loss=signal.stop_loss,
-                take_profit=signal.take_profit,
-                units=abs(result.units or units),
-                trade_id=result.trade_id,
-                opening_range_high=signal.opening_range.high,
-                opening_range_low=signal.opening_range.low,
-            )
+                # Store pending order info for monitoring
+                self._pending_orders[instrument] = {
+                    "order_id": result.order_id,
+                    "session": signal.session,
+                    "direction": signal.direction,
+                    "entry_price": signal.entry_price,
+                    "stop_loss": signal.stop_loss,
+                    "take_profit": signal.take_profit,
+                    "units": abs(units),
+                    "opening_range_high": signal.opening_range.high,
+                    "opening_range_low": signal.opening_range.low,
+                }
 
-            # Track position
-            self._open_positions[instrument] = {
-                "trade_id": result.trade_id,
-                "db_id": db_id,
-                "session": signal.session,
-                "direction": signal.direction,
-                "entry_price": result.fill_price or signal.entry_price,
-                "stop_loss": signal.stop_loss,
-                "take_profit": signal.take_profit,
-                "units": abs(result.units or units),
-            }
-
-            if result.trade_id:
-                self._db_trade_ids[result.trade_id] = db_id
-
-            # Update session manager
-            sm = self.session_managers[instrument]
-            sm.set_trade_id(signal.session, result.trade_id)
+                # Tell session manager about the pending order ID
+                sm.set_pending_order_id(signal.session, result.order_id)
 
         else:
+            # Order placement failed — revert state to WATCHING_FOR_BREAKOUT
             logger.error(f"ORDER FAILED | {instrument} | {result.error}")
+            sm = self.session_managers[instrument]
+            ctx = sm.get_context(signal.session)
+            if ctx.state == SessionState.PENDING_ORDER:
+                ctx.current_trade = None
+                ctx.pending_order_id = None
+                ctx.pending_order_time = None
+                ctx.state = SessionState.WATCHING_FOR_BREAKOUT
+                logger.info(
+                    f"[{signal.session.value}] {instrument} -> WATCHING_FOR_BREAKOUT (order failed)"
+                )
 
     def _on_trade_closed(self, record, instrument: str) -> None:
         """Handle trade closed notification from session manager.
@@ -209,6 +239,113 @@ class TradingBot:
             f"TRADE CLOSED (session) | {instrument} | "
             f"Exit: {record.exit_price} Reason: {record.exit_reason}"
         )
+
+    def _check_pending_orders(self) -> None:
+        """Check pending limit orders — fill or timeout after 10 minutes."""
+        for instrument in list(self._pending_orders.keys()):
+            pending = self._pending_orders[instrument]
+            order_id = pending["order_id"]
+            session = pending["session"]
+            sm = self.session_managers[instrument]
+            ctx = sm.get_context(session)
+
+            if ctx.state != SessionState.PENDING_ORDER:
+                # State was changed externally (e.g., session closed)
+                del self._pending_orders[instrument]
+                continue
+
+            # Check order status with OANDA
+            order_details = self.client.get_order_details(order_id)
+
+            if order_details is None:
+                logger.warning(
+                    f"PENDING ORDER | {instrument} | Could not fetch order {order_id}"
+                )
+                continue
+
+            order_state = order_details.get("state", "")
+
+            if order_state == "FILLED":
+                # Order filled — extract trade ID and fill price
+                trade_id = order_details.get("tradeOpenedID")
+                fill_price = float(order_details.get("fillingTransactionID", 0))
+
+                # Get actual fill info from the trade
+                if trade_id:
+                    open_trades = self.client.get_open_trades(instrument)
+                    for t in open_trades:
+                        if t["id"] == trade_id:
+                            fill_price = float(t.get("price", pending["entry_price"]))
+                            break
+                    else:
+                        fill_price = pending["entry_price"]
+                else:
+                    fill_price = pending["entry_price"]
+                    trade_id = order_details.get("id")
+
+                logger.info(
+                    f"PENDING ORDER FILLED | {instrument} | "
+                    f"Trade ID: {trade_id} @ {fill_price:.5f}"
+                )
+
+                # Log to database
+                db_id = self.trade_logger.log_entry(
+                    instrument=instrument,
+                    session=session,
+                    direction=pending["direction"],
+                    entry_price=fill_price,
+                    stop_loss=pending["stop_loss"],
+                    take_profit=pending["take_profit"],
+                    units=pending["units"],
+                    trade_id=trade_id,
+                    opening_range_high=pending["opening_range_high"],
+                    opening_range_low=pending["opening_range_low"],
+                )
+
+                # Track position
+                self._open_positions[instrument] = {
+                    "trade_id": trade_id,
+                    "db_id": db_id,
+                    "session": session,
+                    "direction": pending["direction"],
+                    "entry_price": fill_price,
+                    "stop_loss": pending["stop_loss"],
+                    "take_profit": pending["take_profit"],
+                    "units": pending["units"],
+                }
+                if trade_id:
+                    self._db_trade_ids[trade_id] = db_id
+
+                # Transition to IN_TRADE
+                sm.confirm_order_filled(session, trade_id, fill_price)
+
+                del self._pending_orders[instrument]
+
+            elif order_state == "CANCELLED":
+                logger.info(
+                    f"PENDING ORDER CANCELLED | {instrument} | Order {order_id}"
+                )
+                sm.cancel_pending_order(session)
+                del self._pending_orders[instrument]
+
+            elif order_state == "PENDING":
+                # Check timeout — cancel after 10 minutes
+                if ctx.pending_order_time:
+                    elapsed = self._get_current_time_ny() - ctx.pending_order_time
+                    if elapsed > timedelta(minutes=10):
+                        logger.info(
+                            f"PENDING ORDER TIMEOUT | {instrument} | "
+                            f"Order {order_id} expired after {elapsed}"
+                        )
+                        # Cancel the order with OANDA
+                        cancelled = self.client.cancel_order(order_id)
+                        if cancelled:
+                            sm.cancel_pending_order(session)
+                        else:
+                            logger.error(
+                                f"Failed to cancel timed out order {order_id} for {instrument}"
+                            )
+                        del self._pending_orders[instrument]
 
     def _check_positions(self) -> None:
         """Check and update open positions from OANDA."""
@@ -429,6 +566,14 @@ class TradingBot:
                         f"Trades: {session_status['trades']}"
                     )
 
+        # Log pending orders
+        for instrument, pending in self._pending_orders.items():
+            logger.info(
+                f"{instrument} | PENDING ORDER | "
+                f"{pending['direction'].value} {pending['units']} units @ {pending['entry_price']:.5f} "
+                f"(order_id={pending['order_id']})"
+            )
+
         # Log positions
         for instrument, pos in self._open_positions.items():
             logger.info(
@@ -472,6 +617,9 @@ class TradingBot:
                 try:
                     # Process candles
                     self._process_candles()
+
+                    # Check pending limit orders (fill/timeout)
+                    self._check_pending_orders()
 
                     # Check positions
                     self._check_positions()

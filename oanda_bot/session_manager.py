@@ -34,6 +34,7 @@ class SessionState(Enum):
     WAITING_FOR_SESSION = "WAITING_FOR_SESSION"
     RECORDING_RANGE = "RECORDING_RANGE"
     WATCHING_FOR_BREAKOUT = "WATCHING_FOR_BREAKOUT"
+    PENDING_ORDER = "PENDING_ORDER"
     IN_TRADE = "IN_TRADE"
     SESSION_CLOSED = "SESSION_CLOSED"
 
@@ -64,6 +65,8 @@ class SessionContext:
     trades: list[TradeRecord] = field(default_factory=list)
     current_trade: Optional[TradeRecord] = None
     current_trade_id: Optional[str] = None
+    pending_order_id: Optional[str] = None
+    pending_order_time: Optional[datetime] = None
     last_candle_time: Optional[datetime] = None
 
     @property
@@ -85,6 +88,8 @@ class SessionContext:
         self.trades = []
         self.current_trade = None
         self.current_trade_id = None
+        self.pending_order_id = None
+        self.pending_order_time = None
         self.last_candle_time = None
         logger.info(f"Session context reset: {self.session.value} {self.instrument}")
 
@@ -315,7 +320,7 @@ class SessionManager:
             if ctx.can_trade and self._is_in_entry_window(current_time, config):
                 signal = ctx.breakout_detector.check_breakout(candle)
                 if signal:
-                    # Create trade record
+                    # Create trade record (will be finalized on fill)
                     ctx.current_trade = TradeRecord(
                         direction=signal.direction,
                         entry_price=signal.entry_price,
@@ -323,14 +328,27 @@ class SessionManager:
                         take_profit=signal.take_profit,
                         entry_time=self.get_current_time_ny(),
                     )
-                    ctx.state = SessionState.IN_TRADE
+                    ctx.state = SessionState.PENDING_ORDER
+                    ctx.pending_order_time = self.get_current_time_ny()
                     logger.info(
-                        f"[{ctx.session.value}] {self.instrument} -> IN_TRADE "
+                        f"[{ctx.session.value}] {self.instrument} -> PENDING_ORDER "
                         f"({signal.direction.value} @ {signal.entry_price:.5f})"
                     )
 
                     if self.on_signal:
                         self.on_signal(signal)
+
+        elif ctx.state == SessionState.PENDING_ORDER:
+            # Check for time close - cancel pending order if session ending
+            if self._is_time_to_close(current_time, config):
+                self._cancel_pending_order(ctx)
+                ctx.state = SessionState.SESSION_CLOSED
+                logger.info(
+                    f"[{ctx.session.value}] {self.instrument} -> SESSION_CLOSED (time, pending cancelled)"
+                )
+                return None
+
+            # Pending order monitoring handled by check_pending_order() called from main loop
 
         elif ctx.state == SessionState.IN_TRADE:
             # Check for time close
@@ -393,6 +411,103 @@ class SessionManager:
 
         ctx.current_trade = None
         ctx.current_trade_id = None
+
+    def set_pending_order_id(self, session: SessionName, order_id: str) -> None:
+        """Set the OANDA order ID for a pending limit order.
+
+        Args:
+            session: Session name.
+            order_id: OANDA order ID.
+        """
+        ctx = self.contexts[session]
+        ctx.pending_order_id = order_id
+
+    def confirm_order_filled(
+        self,
+        session: SessionName,
+        trade_id: str,
+        fill_price: float,
+    ) -> None:
+        """Confirm a pending order has been filled — transition to IN_TRADE.
+
+        Args:
+            session: Session name.
+            trade_id: OANDA trade ID from fill.
+            fill_price: Actual fill price.
+        """
+        ctx = self.contexts[session]
+        if ctx.state != SessionState.PENDING_ORDER:
+            return
+
+        ctx.state = SessionState.IN_TRADE
+        ctx.current_trade_id = trade_id
+        ctx.pending_order_id = None
+        ctx.pending_order_time = None
+
+        if ctx.current_trade:
+            ctx.current_trade.trade_id = trade_id
+            ctx.current_trade.entry_price = fill_price
+
+        logger.info(
+            f"[{session.value}] {self.instrument} -> IN_TRADE "
+            f"(filled @ {fill_price:.5f}, trade_id={trade_id})"
+        )
+
+    def cancel_pending_order(self, session: SessionName) -> Optional[str]:
+        """Cancel a pending order and return to WATCHING_FOR_BREAKOUT.
+
+        Called from the main loop when the order times out or is externally cancelled.
+
+        Args:
+            session: Session name.
+
+        Returns:
+            The order ID that should be cancelled, or None.
+        """
+        ctx = self.contexts[session]
+        if ctx.state != SessionState.PENDING_ORDER:
+            return None
+
+        order_id = ctx.pending_order_id
+        self._cancel_pending_order(ctx)
+        ctx.state = SessionState.WATCHING_FOR_BREAKOUT
+        logger.info(
+            f"[{session.value}] {self.instrument} -> WATCHING_FOR_BREAKOUT "
+            f"(pending order cleared, re-entry allowed)"
+        )
+        return order_id
+
+    def _cancel_pending_order(self, ctx: SessionContext) -> None:
+        """Internal: clear pending order state and revert to watching.
+
+        Args:
+            ctx: Session context.
+        """
+        order_id = ctx.pending_order_id
+
+        # Reset breakout direction so the same signal can re-trigger
+        if ctx.breakout_detector and ctx.current_trade:
+            ctx.breakout_detector.reset_direction(ctx.current_trade.direction)
+
+        ctx.current_trade = None
+        ctx.pending_order_id = None
+        ctx.pending_order_time = None
+
+        logger.info(
+            f"[{ctx.session.value}] {self.instrument} pending order cancelled "
+            f"(order_id={order_id})"
+        )
+
+    def get_pending_order_contexts(self) -> list[tuple[SessionName, SessionContext]]:
+        """Get all contexts with pending orders.
+
+        Returns:
+            List of (session_name, context) tuples in PENDING_ORDER state.
+        """
+        return [
+            (session, ctx) for session, ctx in self.contexts.items()
+            if ctx.state == SessionState.PENDING_ORDER
+        ]
 
     def handle_trade_exit(
         self,
@@ -460,6 +575,7 @@ class SessionManager:
             if ctx.state in (
                 SessionState.RECORDING_RANGE,
                 SessionState.WATCHING_FOR_BREAKOUT,
+                SessionState.PENDING_ORDER,
                 SessionState.IN_TRADE,
             )
         ]
@@ -476,6 +592,7 @@ class SessionManager:
                 "trades": ctx.trade_count,
                 "can_trade": ctx.can_trade,
                 "opening_range": str(ctx.opening_range) if ctx.opening_range else None,
+                "pending_order_id": ctx.pending_order_id,
                 "current_trade": {
                     "direction": ctx.current_trade.direction.value,
                     "entry": ctx.current_trade.entry_price,

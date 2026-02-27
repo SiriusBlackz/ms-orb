@@ -259,8 +259,8 @@ class OANDAClient:
             self.api.request(r)
 
             pos = r.response.get("position", {})
-            long_units = int(pos.get("long", {}).get("units", 0))
-            short_units = int(pos.get("short", {}).get("units", 0))
+            long_units = int(float(pos.get("long", {}).get("units", 0)))
+            short_units = int(float(pos.get("short", {}).get("units", 0)))
 
             if long_units == 0 and short_units == 0:
                 return None
@@ -304,8 +304,8 @@ class OANDAClient:
             result = []
             for pos in r.response.get("positions", []):
                 instrument = pos["instrument"]
-                long_units = int(pos.get("long", {}).get("units", 0))
-                short_units = int(pos.get("short", {}).get("units", 0))
+                long_units = int(float(pos.get("long", {}).get("units", 0)))
+                short_units = int(float(pos.get("short", {}).get("units", 0)))
 
                 if long_units > 0:
                     result.append(Position(
@@ -391,7 +391,7 @@ class OANDAClient:
                 "order": {
                     "type": "MARKET",
                     "instrument": instrument,
-                    "units": str(units),
+                    "units": str(int(units)),
                     "timeInForce": "FOK",  # Fill or Kill
                     "stopLossOnFill": {
                         "price": f"{stop_loss:.{precision}f}",
@@ -415,7 +415,7 @@ class OANDAClient:
                     order_id=fill.get("orderID"),
                     trade_id=fill.get("tradeOpened", {}).get("tradeID"),
                     fill_price=float(fill.get("price", 0)),
-                    units=int(fill.get("units", 0)),
+                    units=int(float(fill.get("units", 0))),
                 )
             elif "orderCancelTransaction" in response:
                 cancel = response["orderCancelTransaction"]
@@ -467,7 +467,7 @@ class OANDAClient:
             order_data = {
                 "type": "LIMIT",
                 "instrument": instrument,
-                "units": str(units),
+                "units": str(int(units)),
                 "price": f"{price:.{precision}f}",
                 "timeInForce": "GTD" if gtd_time else "GTC",
                 "stopLossOnFill": {
@@ -497,7 +497,7 @@ class OANDAClient:
                     order_id=fill.get("orderID"),
                     trade_id=fill.get("tradeOpened", {}).get("tradeID"),
                     fill_price=float(fill.get("price", 0)),
-                    units=int(fill.get("units", 0)),
+                    units=int(float(fill.get("units", 0))),
                 )
             elif "orderCreateTransaction" in response:
                 create = response["orderCreateTransaction"]
@@ -523,6 +523,48 @@ class OANDAClient:
         except Exception as e:
             logger.error(f"Limit order failed for {instrument}: {e}")
             return OrderResult(success=False, error=str(e))
+
+    def get_order_details(self, order_id: str) -> Optional[dict]:
+        """Get details of a specific order.
+
+        Args:
+            order_id: OANDA order ID.
+
+        Returns:
+            Order dict with 'state', 'type', 'tradeOpenedID' etc., or None if failed.
+        """
+        try:
+            r = orders.OrderDetails(self.account_id, orderID=order_id)
+            self.api.request(r)
+            return r.response.get("order", {})
+        except oandapyV20.exceptions.V20Error as e:
+            if "404" in str(e):
+                return None
+            logger.error(f"Failed to get order {order_id}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get order {order_id}: {e}")
+            return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a pending order.
+
+        Args:
+            order_id: OANDA order ID.
+
+        Returns:
+            True if cancelled successfully, False otherwise.
+        """
+        try:
+            r = orders.OrderCancel(self.account_id, orderID=order_id)
+            self.api.request(r)
+            return True
+        except oandapyV20.exceptions.V20Error as e:
+            logger.error(f"Failed to cancel order {order_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to cancel order {order_id}: {e}")
+            return False
 
     def close_position(self, instrument: str) -> OrderResult:
         """Close all positions for an instrument.
@@ -558,7 +600,7 @@ class OANDAClient:
                 success=True,
                 order_id=fill.get("orderID"),
                 fill_price=float(fill.get("price", 0)),
-                units=int(fill.get("units", 0)),
+                units=int(float(fill.get("units", 0))),
             )
 
         except Exception as e:
@@ -646,7 +688,7 @@ class OANDAClient:
                     order_id=fill.get("orderID"),
                     trade_id=trade_id,
                     fill_price=float(fill.get("price", 0)),
-                    units=int(fill.get("units", 0)),
+                    units=int(float(fill.get("units", 0))),
                 )
 
             return OrderResult(success=True)
