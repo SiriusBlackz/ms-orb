@@ -607,6 +607,29 @@ class OANDAClient:
             logger.error(f"Failed to close position for {instrument}: {e}")
             return OrderResult(success=False, error=str(e))
 
+    def get_trade_details(self, trade_id: str) -> Optional[dict]:
+        """Get details of a specific trade (open or closed).
+
+        Args:
+            trade_id: OANDA trade ID.
+
+        Returns:
+            Trade dict with 'state', 'averageClosePrice', 'closingTransactionIDs',
+            etc., or None if failed.
+        """
+        try:
+            r = trades.TradeDetails(self.account_id, tradeID=trade_id)
+            self.api.request(r)
+            return r.response.get("trade", {})
+        except oandapyV20.exceptions.V20Error as e:
+            if "404" in str(e):
+                return None
+            logger.error(f"Failed to get trade {trade_id}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get trade {trade_id}: {e}")
+            return None
+
     def get_open_trades(self, instrument: str = None) -> list[dict]:
         """Get open trades.
 

@@ -283,7 +283,14 @@ class SessionManager:
                 # Still in range period - add candle
                 ctx.range_recorder.add_candle(candle)
             else:
-                # Range period ended - finalize and move to watching
+                # Range period ended — add this candle if its start time
+                # falls within the range period (the last range candle
+                # completes exactly at range_end so current_time is past
+                # the range, but the candle's start belongs to it).
+                candle_time_ny = candle.time.astimezone(NY_TZ).time()
+                if config.range_start <= candle_time_ny < config.range_end:
+                    ctx.range_recorder.add_candle(candle)
+
                 ctx.opening_range = ctx.range_recorder.finalize()
                 if ctx.opening_range:
                     ctx.breakout_detector = BreakoutDetector(

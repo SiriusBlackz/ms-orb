@@ -220,6 +220,9 @@ class TradingBot:
             sm = self.session_managers[instrument]
             ctx = sm.get_context(signal.session)
             if ctx.state == SessionState.PENDING_ORDER:
+                # Reset direction so the same breakout can re-trigger
+                if ctx.breakout_detector:
+                    ctx.breakout_detector.reset_direction(signal.direction)
                 ctx.current_trade = None
                 ctx.pending_order_id = None
                 ctx.pending_order_time = None
@@ -241,7 +244,7 @@ class TradingBot:
         )
 
     def _check_pending_orders(self) -> None:
-        """Check pending limit orders — fill or timeout after 10 minutes."""
+        """Check pending limit orders — fill, timeout (30 min), or 2% directional move."""
         for instrument in list(self._pending_orders.keys()):
             pending = self._pending_orders[instrument]
             order_id = pending["order_id"]
@@ -337,23 +340,46 @@ class TradingBot:
                 del self._pending_orders[instrument]
 
             elif order_state == "PENDING":
-                # Check timeout — cancel after 10 minutes
+                cancel_reason = None
+
+                # Check timeout — cancel after 30 minutes
                 if ctx.pending_order_time:
                     elapsed = self._get_current_time_ny() - ctx.pending_order_time
-                    if elapsed > timedelta(minutes=10):
-                        logger.info(
-                            f"PENDING ORDER TIMEOUT | {instrument} | "
-                            f"Order {order_id} expired after {elapsed}"
-                        )
-                        # Cancel the order with OANDA
-                        cancelled = self.client.cancel_order(order_id)
-                        if cancelled:
-                            sm.cancel_pending_order(session)
-                        else:
-                            logger.error(
-                                f"Failed to cancel timed out order {order_id} for {instrument}"
+                    if elapsed > timedelta(minutes=30):
+                        cancel_reason = f"expired after {elapsed}"
+
+                # Check 2% directional move (breakout ran away without fill)
+                if not cancel_reason:
+                    price = self.client.get_price(instrument)
+                    if price:
+                        current = price.mid
+                        entry = pending["entry_price"]
+                        pct_move = (current - entry) / entry
+
+                        if pending["direction"] == Direction.LONG and pct_move > 0.02:
+                            cancel_reason = (
+                                f"price ran {pct_move:.2%} above limit buy "
+                                f"(current={current:.5f} entry={entry:.5f})"
                             )
-                        del self._pending_orders[instrument]
+                        elif pending["direction"] == Direction.SHORT and pct_move < -0.02:
+                            cancel_reason = (
+                                f"price ran {abs(pct_move):.2%} below limit sell "
+                                f"(current={current:.5f} entry={entry:.5f})"
+                            )
+
+                if cancel_reason:
+                    logger.info(
+                        f"PENDING ORDER CANCEL | {instrument} | "
+                        f"Order {order_id} — {cancel_reason}"
+                    )
+                    cancelled = self.client.cancel_order(order_id)
+                    if cancelled:
+                        sm.cancel_pending_order(session)
+                    else:
+                        logger.error(
+                            f"Failed to cancel order {order_id} for {instrument}"
+                        )
+                    del self._pending_orders[instrument]
 
     def _check_positions(self) -> None:
         """Check and update open positions from OANDA."""
@@ -380,80 +406,92 @@ class TradingBot:
                     if trade_id in self._db_trade_ids:
                         del self._db_trade_ids[trade_id]
 
-                    # Get final price from position history if available
                     exit_price = None
                     exit_reason = "unknown"
 
-                    # Try to determine exit reason from price movement
-                    price = self.client.get_price(instrument)
-                    if price:
-                        current_price = price.mid
-
-                        if pos_info["direction"] == Direction.LONG:
-                            if current_price <= pos_info["stop_loss"]:
+                    try:
+                        # Get exact exit price from trade details API
+                        trade_details = self.client.get_trade_details(trade_id)
+                        if trade_details and trade_details.get("averageClosePrice"):
+                            exit_price = float(trade_details["averageClosePrice"])
+                            # Determine exit reason by comparing close price
+                            # distance to SL vs TP
+                            sl_dist = abs(exit_price - pos_info["stop_loss"])
+                            tp_dist = abs(exit_price - pos_info["take_profit"])
+                            if sl_dist < tp_dist:
                                 exit_reason = "stop"
-                                exit_price = pos_info["stop_loss"]
-                            elif current_price >= pos_info["take_profit"]:
-                                exit_reason = "target"
-                                exit_price = pos_info["take_profit"]
                             else:
-                                exit_reason = "unknown"
-                                exit_price = current_price
-                        else:
-                            if current_price >= pos_info["stop_loss"]:
-                                exit_reason = "stop"
-                                exit_price = pos_info["stop_loss"]
-                            elif current_price <= pos_info["take_profit"]:
                                 exit_reason = "target"
-                                exit_price = pos_info["take_profit"]
-                            else:
-                                exit_reason = "unknown"
-                                exit_price = current_price
+                            logger.debug(
+                                f"Trade details | {instrument} | "
+                                f"closePrice={exit_price:.5f} reason={exit_reason}"
+                            )
 
-                    if not exit_price:
-                        logger.warning(
-                            f"Could not determine exit price for {instrument}, "
-                            f"using entry price as fallback"
+                        # Fall back to current market price if trade details unavailable
+                        if not exit_price:
+                            price = self.client.get_price(instrument)
+                            if price:
+                                current_price = price.mid
+                                if pos_info["direction"] == Direction.LONG:
+                                    if current_price <= pos_info["stop_loss"]:
+                                        exit_reason = "stop"
+                                        exit_price = pos_info["stop_loss"]
+                                    elif current_price >= pos_info["take_profit"]:
+                                        exit_reason = "target"
+                                        exit_price = pos_info["take_profit"]
+                                    else:
+                                        exit_price = current_price
+                                else:
+                                    if current_price >= pos_info["stop_loss"]:
+                                        exit_reason = "stop"
+                                        exit_price = pos_info["stop_loss"]
+                                    elif current_price <= pos_info["take_profit"]:
+                                        exit_reason = "target"
+                                        exit_price = pos_info["take_profit"]
+                                    else:
+                                        exit_price = current_price
+
+                        if not exit_price:
+                            logger.warning(
+                                f"Could not determine exit price for {instrument}, "
+                                f"using entry price as fallback"
+                            )
+                            exit_price = pos_info["entry_price"]
+
+                        # Calculate and log PnL
+                        pnl = calculate_pnl(
+                            pos_info["direction"].value,
+                            pos_info["entry_price"],
+                            exit_price,
+                            pos_info["units"],
                         )
-                        exit_price = pos_info["entry_price"]
+                        rr = calculate_rr_achieved(
+                            pos_info["direction"].value,
+                            pos_info["entry_price"],
+                            exit_price,
+                            pos_info["stop_loss"],
+                        )
 
-                    if exit_price:
-                        # Calculate PnL
-                        try:
-                            pnl = calculate_pnl(
-                                pos_info["direction"].value,
-                                pos_info["entry_price"],
-                                exit_price,
-                                pos_info["units"],
-                            )
-                            rr = calculate_rr_achieved(
-                                pos_info["direction"].value,
-                                pos_info["entry_price"],
-                                exit_price,
-                                pos_info["stop_loss"],
-                            )
+                        self.trade_logger.log_exit(
+                            row_id=pos_info["db_id"],
+                            exit_price=exit_price,
+                            exit_reason=exit_reason,
+                            pnl=pnl,
+                            rr_achieved=rr,
+                        )
 
-                            # Log exit
-                            self.trade_logger.log_exit(
-                                row_id=pos_info["db_id"],
-                                exit_price=exit_price,
-                                exit_reason=exit_reason,
-                                pnl=pnl,
-                                rr_achieved=rr,
-                            )
-
-                            logger.info(
-                                f"EXIT LOGGED | {instrument} | "
-                                f"Price: {exit_price:.5f} Reason: {exit_reason} "
-                                f"PnL: {pnl:.2f} RR: {rr:.2f}"
-                            )
-                        except Exception as e:
-                            logger.error(f"Error logging exit for {instrument}: {e}")
-
-                    # Always notify session manager so it can transition
-                    # back to WATCHING_FOR_BREAKOUT for re-entry
-                    sm = self.session_managers[instrument]
-                    sm.handle_trade_exit(pos_info["session"], exit_reason, exit_price)
+                        logger.info(
+                            f"EXIT LOGGED | {instrument} | "
+                            f"Price: {exit_price:.5f} Reason: {exit_reason} "
+                            f"PnL: {pnl:.2f} RR: {rr:.2f}"
+                        )
+                    except Exception as e:
+                        logger.error(f"Error logging exit for {instrument}: {e}")
+                    finally:
+                        # Always notify session manager so it can transition
+                        # back to WATCHING_FOR_BREAKOUT for re-entry
+                        sm = self.session_managers[instrument]
+                        sm.handle_trade_exit(pos_info["session"], exit_reason, exit_price)
 
             except Exception as e:
                 logger.error(f"Error checking position for {instrument}: {e}", exc_info=True)
