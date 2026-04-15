@@ -26,8 +26,8 @@ from config import (
     TradingConfig,
     TIMEZONE,
 )
-from oanda_client import OANDAClient, Candle
-from session_manager import SessionManager, SessionState
+from oanda_client import OANDAClient, Candle, Position
+from session_manager import SessionManager, SessionState, TradeRecord
 from strategy import BreakoutSignal, Direction, calculate_position_size
 from trade_logger import TradeLogger, calculate_pnl, calculate_rr_achieved
 
@@ -103,6 +103,95 @@ class TradingBot:
         """Get current time in New York timezone."""
         return datetime.now(NY_TZ)
 
+    def _adopt_existing_position(self, instrument: str, pos: Position) -> None:
+        """Adopt an existing position found on startup into bot tracking.
+
+        Args:
+            instrument: Instrument name.
+            pos: Position object from OANDA.
+        """
+        open_trades = self.client.get_open_trades(instrument)
+        if not open_trades:
+            logger.warning(
+                f"Position found for {instrument} but no open trades — "
+                f"cannot adopt (may be hedged or closing)"
+            )
+            return
+
+        trade = open_trades[0]
+        trade_id = trade["id"]
+        entry_price = float(trade.get("price", pos.avg_price))
+        direction = Direction.LONG if pos.units > 0 else Direction.SHORT
+
+        # Get SL/TP from attached orders
+        stop_loss = float(trade.get("stopLossOrder", {}).get("price", 0))
+        take_profit = float(trade.get("takeProfitOrder", {}).get("price", 0))
+
+        if not stop_loss or not take_profit:
+            logger.warning(
+                f"Adopted position {instrument} missing SL={stop_loss} TP={take_profit}"
+            )
+
+        # Determine which session this trade actually opened in by mapping the
+        # trade's openTime against each session's window. Do NOT default to the
+        # currently active session — a Tokyo trade still open at 10:30 NY would
+        # otherwise corrupt the NY context and block NY from trading that day.
+        sm = self.session_managers[instrument]
+        trade_session = None
+        open_time_raw = trade.get("openTime")
+        if open_time_raw:
+            try:
+                open_dt_utc = datetime.fromisoformat(open_time_raw.replace("Z", "+00:00"))
+                open_dt_ny = open_dt_utc.astimezone(NY_TZ)
+                trade_session = sm.infer_session_from_time(open_dt_ny)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Could not parse openTime={open_time_raw} for {instrument}: {e}"
+                )
+
+        if trade_session is None:
+            logger.warning(
+                f"Could not attribute adopted position {instrument} to any session "
+                f"(openTime={open_time_raw}) — skipping adoption, will rely on "
+                f"OANDA's attached SL/TP to close it"
+            )
+            return
+
+        active_session = trade_session
+
+        # Track the position (db_id=None since we didn't open this trade)
+        self._open_positions[instrument] = {
+            "trade_id": trade_id,
+            "db_id": None,
+            "session": active_session,
+            "direction": direction,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "units": abs(pos.units),
+        }
+        self._db_trade_ids[trade_id] = None
+
+        # Set session state to IN_TRADE so we don't generate new signals
+        ctx = sm.get_context(active_session)
+        ctx.state = SessionState.IN_TRADE
+        ctx.current_trade_id = trade_id
+        ctx.current_trade = TradeRecord(
+            direction=direction,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            entry_time=self._get_current_time_ny(),
+            trade_id=trade_id,
+        )
+
+        logger.info(
+            f"ADOPTED POSITION | {instrument} | {direction.value} "
+            f"{abs(pos.units)} units @ {entry_price:.5f} | "
+            f"SL={stop_loss} TP={take_profit} | "
+            f"trade_id={trade_id} session={active_session.value}"
+        )
+
     def _on_signal(self, signal: BreakoutSignal, instrument: str) -> None:
         """Handle a breakout signal.
 
@@ -115,6 +204,38 @@ class TradingBot:
             f"{signal.direction.value} @ {signal.entry_price:.5f} "
             f"SL={signal.stop_loss:.5f} TP={signal.take_profit:.5f}"
         )
+
+        # Guard: skip if we already have a position or pending order for this instrument.
+        # Log loudly when the blocker is from a DIFFERENT session — that's a symptom
+        # of a Tokyo position leaking past its session close and blocking London/NY.
+        if instrument in self._open_positions:
+            blocker_session = self._open_positions[instrument].get("session")
+            if blocker_session == signal.session:
+                logger.warning(
+                    f"SIGNAL SKIPPED | {instrument} | {signal.session.value} | "
+                    f"already has open position for this session"
+                )
+            else:
+                logger.error(
+                    f"SIGNAL SKIPPED | {instrument} | {signal.session.value} signal "
+                    f"blocked by stale {blocker_session.value if blocker_session else 'UNKNOWN'} "
+                    f"position — time exit may have failed; investigate _check_time_exits"
+                )
+            return
+        if instrument in self._pending_orders:
+            blocker_session = self._pending_orders[instrument].get("session")
+            if blocker_session == signal.session:
+                logger.warning(
+                    f"SIGNAL SKIPPED | {instrument} | {signal.session.value} | "
+                    f"already has pending order for this session"
+                )
+            else:
+                logger.error(
+                    f"SIGNAL SKIPPED | {instrument} | {signal.session.value} signal "
+                    f"blocked by stale {blocker_session.value if blocker_session else 'UNKNOWN'} "
+                    f"pending order"
+                )
+            return
 
         if self.dry_run:
             logger.info("DRY RUN - Order not placed")
@@ -472,13 +593,19 @@ class TradingBot:
                             pos_info["stop_loss"],
                         )
 
-                        self.trade_logger.log_exit(
-                            row_id=pos_info["db_id"],
-                            exit_price=exit_price,
-                            exit_reason=exit_reason,
-                            pnl=pnl,
-                            rr_achieved=rr,
-                        )
+                        if pos_info["db_id"] is not None:
+                            self.trade_logger.log_exit(
+                                row_id=pos_info["db_id"],
+                                exit_price=exit_price,
+                                exit_reason=exit_reason,
+                                pnl=pnl,
+                                rr_achieved=rr,
+                            )
+                        else:
+                            logger.warning(
+                                f"EXIT NOT LOGGED | {instrument} | "
+                                f"adopted position has no db_id"
+                            )
 
                         logger.info(
                             f"EXIT LOGGED | {instrument} | "
@@ -511,13 +638,12 @@ class TradingBot:
 
             # Handle midnight crossing for Tokyo
             if config.range_start > config.session_close:
-                # Tokyo style
-                if current_time > config.entry_end:
-                    # After entry end same day
-                    should_close = current_time >= config.session_close
-                elif current_time <= config.session_close:
-                    # Next day before session close
-                    should_close = current_time >= config.session_close
+                # Tokyo style: e.g. range_start=18:00, session_close=02:54
+                # Close when: past session_close AND before range_start (next session)
+                should_close = (
+                    current_time >= config.session_close
+                    and current_time < config.range_start
+                )
             else:
                 should_close = current_time >= config.session_close
 
@@ -545,13 +671,19 @@ class TradingBot:
                             pos_info["stop_loss"],
                         )
 
-                        self.trade_logger.log_exit(
-                            row_id=pos_info["db_id"],
-                            exit_price=exit_price,
-                            exit_reason="time",
-                            pnl=pnl,
-                            rr_achieved=rr,
-                        )
+                        if pos_info["db_id"] is not None:
+                            self.trade_logger.log_exit(
+                                row_id=pos_info["db_id"],
+                                exit_price=exit_price,
+                                exit_reason="time",
+                                pnl=pnl,
+                                rr_achieved=rr,
+                            )
+                        else:
+                            logger.warning(
+                                f"TIME EXIT NOT LOGGED | {instrument} | "
+                                f"adopted position has no db_id"
+                            )
 
                         logger.info(
                             f"TIME EXIT COMPLETE | {instrument} | "
@@ -608,14 +740,16 @@ class TradingBot:
         for instrument in self.instruments:
             sm = self.session_managers[instrument]
             status = sm.get_status()
+            active = sm.get_active_session()
+            active_marker = f" (active={active.value})" if active else " (active=NONE)"
 
             for session_name, session_status in status.items():
-                if session_status["state"] != "WAITING_FOR_SESSION":
-                    logger.info(
-                        f"{instrument} | {session_name} | "
-                        f"State: {session_status['state']} | "
-                        f"Trades: {session_status['trades']}"
-                    )
+                logger.info(
+                    f"{instrument} | {session_name}{active_marker if session_name == (active.value if active else None) else ''} | "
+                    f"State: {session_status['state']} | "
+                    f"Trades: {session_status['trades']} | "
+                    f"Range: {session_status['opening_range'] or '-'}"
+                )
 
         # Log pending orders
         for instrument, pending in self._pending_orders.items():
@@ -655,6 +789,19 @@ class TradingBot:
                 logger.warning(
                     f"Existing position found: {instrument} | "
                     f"{pos.units} units @ {pos.avg_price}"
+                )
+                self._adopt_existing_position(instrument, pos)
+
+        # If bot started mid-session (past range_end), back-fill the opening
+        # range from historical candles so we can still trade this session.
+        # Skip any instrument whose active-session context is IN_TRADE from
+        # the adoption step above.
+        for instrument in self.instruments:
+            try:
+                self.session_managers[instrument].recover_session_state()
+            except Exception as e:
+                logger.error(
+                    f"Range recovery failed for {instrument}: {e}", exc_info=True
                 )
 
         self._running = True
@@ -749,7 +896,11 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Run the bot
-    bot.run()
+    try:
+        bot.run()
+    except Exception:
+        logger.critical("FATAL: Unhandled exception", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

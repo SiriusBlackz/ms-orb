@@ -200,14 +200,12 @@ class SessionManager:
         """
         # Handle midnight crossing
         if config.range_start > config.session_close:
-            # For Tokyo: after entry_end and before/at session_close (next day)
-            if current_time > config.entry_end and current_time <= time(23, 59, 59):
-                # Still same day, past entry window
-                return current_time >= config.session_close
-            elif current_time <= config.session_close:
-                # Next day
-                return current_time >= config.session_close
-            return False
+            # Tokyo style: e.g. range_start=18:00, session_close=02:54
+            # Close when: past session_close AND before range_start (next session)
+            return (
+                current_time >= config.session_close
+                and current_time < config.range_start
+            )
         else:
             return current_time >= config.session_close
 
@@ -570,6 +568,112 @@ class SessionManager:
             Session context.
         """
         return self.contexts[session]
+
+    def infer_session_from_time(self, ny_dt: datetime) -> Optional[SessionName]:
+        """Determine which session contains the given NY-local datetime.
+
+        Uses each session's [range_start, session_close] window (handling
+        midnight crossing for Tokyo).
+
+        Args:
+            ny_dt: NY-timezone datetime to match against session windows.
+
+        Returns:
+            Matching SessionName or None if the time falls in a session gap.
+        """
+        t = ny_dt.time()
+        for session_name, config in SESSIONS.items():
+            if self._is_time_in_session(t, config):
+                return session_name
+        return None
+
+    def recover_session_state(self) -> None:
+        """Back-fill opening range from historical candles on startup.
+
+        If the bot starts mid-session (after range_end but before session_close),
+        the WAITING_FOR_SESSION -> RECORDING_RANGE transition will never fire
+        because it only triggers when current_time is inside [range_start, range_end).
+        This method detects that case and fetches the M5 candles that covered
+        the range window so the session can still generate signals.
+
+        Only recovers a range for the session that is currently active.
+        """
+        active = self.get_active_session()
+        if active is None:
+            return
+
+        config = SESSIONS[active]
+        now = self.get_current_time_ny()
+        current_time = now.time()
+
+        # Only recover if we're past range_end — if we're still in range_period
+        # the normal state machine will handle it via the next complete candle.
+        if self._is_in_range_period(current_time, config):
+            return
+        if not self._is_time_in_session(current_time, config):
+            return
+
+        ctx = self.contexts[active]
+        if ctx.state != SessionState.WAITING_FOR_SESSION:
+            return
+
+        # Fetch enough M5 candles to cover the range window plus some headroom
+        # for the time already elapsed since range_end. 100 is safely more than
+        # the longest window (Tokyo: 18:00 -> 02:54 next day = ~9h = 108 M5 bars).
+        candles = self.client.get_candles(
+            self.instrument,
+            granularity="M5",
+            count=200,
+            include_incomplete=False,
+        )
+        if not candles:
+            logger.warning(
+                f"[{active.value}] {self.instrument} range recovery failed: "
+                f"no candles returned"
+            )
+            return
+
+        # Determine the NY-local date that owns this session's range window.
+        # For non-midnight-crossing sessions (London/NY) the range is today.
+        # For Tokyo, if we're past midnight NY, the range started yesterday
+        # (18:00 previous NY date); otherwise it started today.
+        session_date = now.date()
+        if config.range_start > config.session_close and current_time <= config.session_close:
+            # We're in the "next day" portion of a Tokyo session — the range
+            # was yesterday at 18:00 NY.
+            from datetime import timedelta as _td
+            session_date = (now - _td(days=1)).date()
+
+        recorder = RangeRecorder(active, self.instrument)
+        for candle in candles:
+            candle_ny = candle.time.astimezone(NY_TZ)
+            if candle_ny.date() != session_date:
+                continue
+            ct = candle_ny.time()
+            if config.range_start <= ct < config.range_end:
+                recorder.add_candle(candle)
+
+        opening_range = recorder.finalize()
+        if opening_range is None:
+            logger.warning(
+                f"[{active.value}] {self.instrument} range recovery failed: "
+                f"no candles matched range window {config.range_start}-{config.range_end} "
+                f"on {session_date}"
+            )
+            return
+
+        ctx.range_recorder = recorder
+        ctx.opening_range = opening_range
+        ctx.breakout_detector = BreakoutDetector(
+            opening_range,
+            rr_target=TradingConfig.RR_TARGET,
+        )
+        ctx.state = SessionState.WATCHING_FOR_BREAKOUT
+        logger.info(
+            f"[{active.value}] {self.instrument} -> WATCHING_FOR_BREAKOUT "
+            f"(recovered from historical candles, H={opening_range.high:.5f} "
+            f"L={opening_range.low:.5f})"
+        )
 
     def get_all_active_contexts(self) -> list[SessionContext]:
         """Get all contexts that are actively trading or watching.
