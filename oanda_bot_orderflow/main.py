@@ -1,0 +1,911 @@
+#!/usr/bin/env python3
+"""MS-ORB Trading Bot (Order Flow Variant) - Main entry point.
+
+Live trading bot for XAUUSD and NAS100 via OANDA v20 REST API.
+Implements MS-ORB with CVD alignment + volume ramp order flow filter.
+
+Filter: Only takes breakouts where range-period CVD confirms direction
+and pre-breakout volume is ramping up. Backtested to improve win rate
+from 22% to 27%, PF from 1.07 to 1.37, and halve max drawdown.
+"""
+
+import argparse
+import logging
+import os
+import signal
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+import pytz
+
+from config import (
+    INSTRUMENTS,
+    LOG_DIR,
+    LOG_LEVEL,
+    SESSIONS,
+    SessionName,
+    TradingConfig,
+    TIMEZONE,
+)
+from oanda_client import OANDAClient, Candle, Position
+from session_manager import SessionManager, SessionState, TradeRecord
+from strategy import BreakoutSignal, Direction, calculate_position_size
+from trade_logger import TradeLogger, calculate_pnl, calculate_rr_achieved
+
+# Set up logging
+LOG_PATH = Path(LOG_DIR)
+LOG_PATH.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_PATH / "bot.log"),
+    ],
+)
+
+logger = logging.getLogger(__name__)
+
+# Timezone
+NY_TZ = pytz.timezone(TIMEZONE)
+
+
+class TradingBot:
+    """Main trading bot orchestrator."""
+
+    def __init__(
+        self,
+        instruments: list[str] = None,
+        dry_run: bool = False,
+    ):
+        """Initialize trading bot.
+
+        Args:
+            instruments: List of instruments to trade. Defaults to config INSTRUMENTS.
+            dry_run: If True, don't place real orders.
+        """
+        self.instruments = instruments or INSTRUMENTS
+        self.dry_run = dry_run
+        self._running = False
+        self._shutdown_requested = False
+
+        # Validate config
+        errors = TradingConfig.validate()
+        if errors:
+            for error in errors:
+                logger.error(f"Config error: {error}")
+            raise ValueError("Configuration validation failed")
+
+        # Initialize components
+        self.client = OANDAClient()
+        self.trade_logger = TradeLogger()
+
+        # Session managers per instrument
+        self.session_managers: dict[str, SessionManager] = {}
+        for instrument in self.instruments:
+            self.session_managers[instrument] = SessionManager(
+                instrument=instrument,
+                client=self.client,
+                on_signal=lambda sig, inst=instrument: self._on_signal(sig, inst),
+                on_trade_closed=lambda rec, inst=instrument: self._on_trade_closed(rec, inst),
+            )
+
+        # Track open positions and pending orders
+        self._open_positions: dict[str, dict] = {}  # instrument -> position info
+        self._pending_orders: dict[str, dict] = {}  # instrument -> pending order info
+        self._db_trade_ids: dict[str, int] = {}  # oanda_trade_id -> db_row_id
+        self._last_candle_times: dict[str, datetime] = {}  # instrument -> last candle time
+
+        logger.info(f"Trading bot initialized for instruments: {self.instruments}")
+        logger.info(f"Dry run mode: {self.dry_run}")
+
+    def _get_current_time_ny(self) -> datetime:
+        """Get current time in New York timezone."""
+        return datetime.now(NY_TZ)
+
+    def _adopt_existing_position(self, instrument: str, pos: Position) -> None:
+        """Adopt an existing position found on startup into bot tracking.
+
+        Args:
+            instrument: Instrument name.
+            pos: Position object from OANDA.
+        """
+        open_trades = self.client.get_open_trades(instrument)
+        if not open_trades:
+            logger.warning(
+                f"Position found for {instrument} but no open trades — "
+                f"cannot adopt (may be hedged or closing)"
+            )
+            return
+
+        trade = open_trades[0]
+        trade_id = trade["id"]
+        entry_price = float(trade.get("price", pos.avg_price))
+        direction = Direction.LONG if pos.units > 0 else Direction.SHORT
+
+        # Get SL/TP from attached orders
+        stop_loss = float(trade.get("stopLossOrder", {}).get("price", 0))
+        take_profit = float(trade.get("takeProfitOrder", {}).get("price", 0))
+
+        if not stop_loss or not take_profit:
+            logger.warning(
+                f"Adopted position {instrument} missing SL={stop_loss} TP={take_profit}"
+            )
+
+        # Determine which session this trade actually opened in by mapping the
+        # trade's openTime against each session's window. Do NOT default to the
+        # currently active session — a Tokyo trade still open at 10:30 NY would
+        # otherwise corrupt the NY context and block NY from trading that day.
+        sm = self.session_managers[instrument]
+        trade_session = None
+        open_time_raw = trade.get("openTime")
+        if open_time_raw:
+            try:
+                open_dt_utc = datetime.fromisoformat(open_time_raw.replace("Z", "+00:00"))
+                open_dt_ny = open_dt_utc.astimezone(NY_TZ)
+                trade_session = sm.infer_session_from_time(open_dt_ny)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Could not parse openTime={open_time_raw} for {instrument}: {e}"
+                )
+
+        if trade_session is None:
+            logger.warning(
+                f"Could not attribute adopted position {instrument} to any session "
+                f"(openTime={open_time_raw}) — skipping adoption, will rely on "
+                f"OANDA's attached SL/TP to close it"
+            )
+            return
+
+        active_session = trade_session
+
+        # Track the position (db_id=None since we didn't open this trade)
+        self._open_positions[instrument] = {
+            "trade_id": trade_id,
+            "db_id": None,
+            "session": active_session,
+            "direction": direction,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "units": abs(pos.units),
+        }
+        self._db_trade_ids[trade_id] = None
+
+        # Set session state to IN_TRADE so we don't generate new signals
+        ctx = sm.get_context(active_session)
+        ctx.state = SessionState.IN_TRADE
+        ctx.current_trade_id = trade_id
+        ctx.current_trade = TradeRecord(
+            direction=direction,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            entry_time=self._get_current_time_ny(),
+            trade_id=trade_id,
+        )
+
+        logger.info(
+            f"ADOPTED POSITION | {instrument} | {direction.value} "
+            f"{abs(pos.units)} units @ {entry_price:.5f} | "
+            f"SL={stop_loss} TP={take_profit} | "
+            f"trade_id={trade_id} session={active_session.value}"
+        )
+
+    def _on_signal(self, signal: BreakoutSignal, instrument: str) -> None:
+        """Handle a breakout signal.
+
+        Args:
+            signal: The breakout signal.
+            instrument: Instrument name.
+        """
+        logger.info(
+            f"SIGNAL | {signal.session.value} {instrument} | "
+            f"{signal.direction.value} @ {signal.entry_price:.5f} "
+            f"SL={signal.stop_loss:.5f} TP={signal.take_profit:.5f}"
+        )
+
+        # Guard: skip if we already have a position or pending order for this instrument.
+        # Log loudly when the blocker is from a DIFFERENT session — that's a symptom
+        # of a Tokyo position leaking past its session close and blocking London/NY.
+        if instrument in self._open_positions:
+            blocker_session = self._open_positions[instrument].get("session")
+            if blocker_session == signal.session:
+                logger.warning(
+                    f"SIGNAL SKIPPED | {instrument} | {signal.session.value} | "
+                    f"already has open position for this session"
+                )
+            else:
+                logger.error(
+                    f"SIGNAL SKIPPED | {instrument} | {signal.session.value} signal "
+                    f"blocked by stale {blocker_session.value if blocker_session else 'UNKNOWN'} "
+                    f"position — time exit may have failed; investigate _check_time_exits"
+                )
+            return
+        if instrument in self._pending_orders:
+            blocker_session = self._pending_orders[instrument].get("session")
+            if blocker_session == signal.session:
+                logger.warning(
+                    f"SIGNAL SKIPPED | {instrument} | {signal.session.value} | "
+                    f"already has pending order for this session"
+                )
+            else:
+                logger.error(
+                    f"SIGNAL SKIPPED | {instrument} | {signal.session.value} signal "
+                    f"blocked by stale {blocker_session.value if blocker_session else 'UNKNOWN'} "
+                    f"pending order"
+                )
+            return
+
+        if self.dry_run:
+            logger.info("DRY RUN - Order not placed")
+            return
+
+        # Get account balance for position sizing
+        balance = self.client.get_account_balance()
+        if balance <= 0:
+            logger.error("Failed to get account balance, skipping trade")
+            return
+
+        # Calculate position size
+        units = calculate_position_size(
+            account_balance=balance,
+            risk_percent=TradingConfig.RISK_PER_TRADE,
+            entry_price=signal.entry_price,
+            stop_price=signal.stop_loss,
+        )
+
+        if units <= 0:
+            logger.warning(f"Position size is 0, skipping trade")
+            return
+
+        # Adjust units for direction
+        if signal.direction == Direction.SHORT:
+            units = -units
+
+        # Place order
+        result = self.client.place_limit_order(
+            instrument=instrument,
+            units=units,
+            price=signal.entry_price,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+        )
+
+        if result.success:
+            sm = self.session_managers[instrument]
+
+            if result.fill_price and result.trade_id:
+                # Limit order filled immediately
+                logger.info(
+                    f"LIMIT ORDER FILLED | {instrument} | {result.units} units @ {result.fill_price} "
+                    f"| Trade ID: {result.trade_id}"
+                )
+
+                # Log to database
+                db_id = self.trade_logger.log_entry(
+                    instrument=instrument,
+                    session=signal.session,
+                    direction=signal.direction,
+                    entry_price=result.fill_price,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit,
+                    units=abs(result.units or units),
+                    trade_id=result.trade_id,
+                    opening_range_high=signal.opening_range.high,
+                    opening_range_low=signal.opening_range.low,
+                )
+
+                # Track position
+                self._open_positions[instrument] = {
+                    "trade_id": result.trade_id,
+                    "db_id": db_id,
+                    "session": signal.session,
+                    "direction": signal.direction,
+                    "entry_price": result.fill_price,
+                    "stop_loss": signal.stop_loss,
+                    "take_profit": signal.take_profit,
+                    "units": abs(result.units or units),
+                }
+                self._db_trade_ids[result.trade_id] = db_id
+
+                # Transition directly to IN_TRADE (skip PENDING_ORDER)
+                sm.confirm_order_filled(signal.session, result.trade_id, result.fill_price)
+
+            else:
+                # Limit order pending — track order ID for monitoring
+                logger.info(
+                    f"LIMIT ORDER PLACED | {instrument} | {units} units @ {signal.entry_price:.5f} "
+                    f"| Order ID: {result.order_id}"
+                )
+
+                # Store pending order info for monitoring
+                self._pending_orders[instrument] = {
+                    "order_id": result.order_id,
+                    "session": signal.session,
+                    "direction": signal.direction,
+                    "entry_price": signal.entry_price,
+                    "stop_loss": signal.stop_loss,
+                    "take_profit": signal.take_profit,
+                    "units": abs(units),
+                    "opening_range_high": signal.opening_range.high,
+                    "opening_range_low": signal.opening_range.low,
+                }
+
+                # Tell session manager about the pending order ID
+                sm.set_pending_order_id(signal.session, result.order_id)
+
+        else:
+            # Order placement failed — revert state to WATCHING_FOR_BREAKOUT
+            logger.error(f"ORDER FAILED | {instrument} | {result.error}")
+            sm = self.session_managers[instrument]
+            ctx = sm.get_context(signal.session)
+            if ctx.state == SessionState.PENDING_ORDER:
+                # Reset direction so the same breakout can re-trigger
+                if ctx.breakout_detector:
+                    ctx.breakout_detector.reset_direction(signal.direction)
+                ctx.current_trade = None
+                ctx.pending_order_id = None
+                ctx.pending_order_time = None
+                ctx.state = SessionState.WATCHING_FOR_BREAKOUT
+                logger.info(
+                    f"[{signal.session.value}] {instrument} -> WATCHING_FOR_BREAKOUT (order failed)"
+                )
+
+    def _on_trade_closed(self, record, instrument: str) -> None:
+        """Handle trade closed notification from session manager.
+
+        Args:
+            record: Trade record.
+            instrument: Instrument name.
+        """
+        logger.info(
+            f"TRADE CLOSED (session) | {instrument} | "
+            f"Exit: {record.exit_price} Reason: {record.exit_reason}"
+        )
+
+    def _check_pending_orders(self) -> None:
+        """Check pending limit orders — fill, timeout (30 min), or 2% directional move."""
+        for instrument in list(self._pending_orders.keys()):
+            pending = self._pending_orders[instrument]
+            order_id = pending["order_id"]
+            session = pending["session"]
+            sm = self.session_managers[instrument]
+            ctx = sm.get_context(session)
+
+            if ctx.state != SessionState.PENDING_ORDER:
+                # State was changed externally (e.g., session closed)
+                del self._pending_orders[instrument]
+                continue
+
+            # Check order status with OANDA
+            order_details = self.client.get_order_details(order_id)
+
+            if order_details is None:
+                logger.warning(
+                    f"PENDING ORDER | {instrument} | Could not fetch order {order_id}"
+                )
+                continue
+
+            order_state = order_details.get("state", "")
+
+            if order_state == "FILLED":
+                # Order filled — extract trade ID and fill price
+                trade_id = order_details.get("tradeOpenedID")
+                fill_price = pending["entry_price"]  # default fallback
+
+                # Get actual fill info from the trade
+                if trade_id:
+                    open_trades = self.client.get_open_trades(instrument)
+                    for t in open_trades:
+                        if t["id"] == trade_id:
+                            fill_price = float(t.get("price", pending["entry_price"]))
+                            break
+                else:
+                    # tradeOpenedID not available — try to find the trade from open trades
+                    open_trades = self.client.get_open_trades(instrument)
+                    if open_trades:
+                        # Use the most recent trade for this instrument
+                        trade_id = open_trades[-1]["id"]
+                        fill_price = float(open_trades[-1].get("price", pending["entry_price"]))
+                    else:
+                        logger.warning(
+                            f"PENDING ORDER FILLED but no trade found | {instrument} | "
+                            f"Order {order_id} — using order ID as fallback"
+                        )
+                        trade_id = order_details.get("id")
+
+                logger.info(
+                    f"PENDING ORDER FILLED | {instrument} | "
+                    f"Trade ID: {trade_id} @ {fill_price:.5f}"
+                )
+
+                # Log to database
+                db_id = self.trade_logger.log_entry(
+                    instrument=instrument,
+                    session=session,
+                    direction=pending["direction"],
+                    entry_price=fill_price,
+                    stop_loss=pending["stop_loss"],
+                    take_profit=pending["take_profit"],
+                    units=pending["units"],
+                    trade_id=trade_id,
+                    opening_range_high=pending["opening_range_high"],
+                    opening_range_low=pending["opening_range_low"],
+                )
+
+                # Track position
+                self._open_positions[instrument] = {
+                    "trade_id": trade_id,
+                    "db_id": db_id,
+                    "session": session,
+                    "direction": pending["direction"],
+                    "entry_price": fill_price,
+                    "stop_loss": pending["stop_loss"],
+                    "take_profit": pending["take_profit"],
+                    "units": pending["units"],
+                }
+                if trade_id:
+                    self._db_trade_ids[trade_id] = db_id
+
+                # Transition to IN_TRADE
+                sm.confirm_order_filled(session, trade_id, fill_price)
+
+                del self._pending_orders[instrument]
+
+            elif order_state == "CANCELLED":
+                logger.info(
+                    f"PENDING ORDER CANCELLED | {instrument} | Order {order_id}"
+                )
+                sm.cancel_pending_order(session)
+                del self._pending_orders[instrument]
+
+            elif order_state == "PENDING":
+                cancel_reason = None
+
+                # Check timeout — cancel after 30 minutes
+                if ctx.pending_order_time:
+                    elapsed = self._get_current_time_ny() - ctx.pending_order_time
+                    if elapsed > timedelta(minutes=30):
+                        cancel_reason = f"expired after {elapsed}"
+
+                # Check 2% directional move (breakout ran away without fill)
+                if not cancel_reason:
+                    price = self.client.get_price(instrument)
+                    if price:
+                        current = price.mid
+                        entry = pending["entry_price"]
+                        pct_move = (current - entry) / entry
+
+                        if pending["direction"] == Direction.LONG and pct_move > 0.02:
+                            cancel_reason = (
+                                f"price ran {pct_move:.2%} above limit buy "
+                                f"(current={current:.5f} entry={entry:.5f})"
+                            )
+                        elif pending["direction"] == Direction.SHORT and pct_move < -0.02:
+                            cancel_reason = (
+                                f"price ran {abs(pct_move):.2%} below limit sell "
+                                f"(current={current:.5f} entry={entry:.5f})"
+                            )
+
+                if cancel_reason:
+                    logger.info(
+                        f"PENDING ORDER CANCEL | {instrument} | "
+                        f"Order {order_id} — {cancel_reason}"
+                    )
+                    cancelled = self.client.cancel_order(order_id)
+                    if cancelled:
+                        sm.cancel_pending_order(session)
+                    else:
+                        logger.error(
+                            f"Failed to cancel order {order_id} for {instrument}"
+                        )
+                    del self._pending_orders[instrument]
+
+    def _check_positions(self) -> None:
+        """Check and update open positions from OANDA."""
+        for instrument in self.instruments:
+            if instrument not in self._open_positions:
+                continue
+
+            pos_info = self._open_positions[instrument]
+            trade_id = pos_info["trade_id"]
+
+            if not trade_id:
+                continue
+
+            try:
+                # Check if trade is still open
+                open_trades = self.client.get_open_trades(instrument)
+                trade_ids = [t["id"] for t in open_trades]
+
+                if trade_id not in trade_ids:
+                    # Trade was closed — remove from tracking FIRST to prevent
+                    # repeated detection if subsequent pnl/logging code throws
+                    logger.info(f"Position closed detected: {instrument} trade_id={trade_id}")
+                    del self._open_positions[instrument]
+                    if trade_id in self._db_trade_ids:
+                        del self._db_trade_ids[trade_id]
+
+                    exit_price = None
+                    exit_reason = "unknown"
+
+                    try:
+                        # Get exact exit price from trade details API
+                        trade_details = self.client.get_trade_details(trade_id)
+                        if trade_details and trade_details.get("averageClosePrice"):
+                            exit_price = float(trade_details["averageClosePrice"])
+                            # Determine exit reason by comparing close price
+                            # distance to SL vs TP
+                            sl_dist = abs(exit_price - pos_info["stop_loss"])
+                            tp_dist = abs(exit_price - pos_info["take_profit"])
+                            if sl_dist < tp_dist:
+                                exit_reason = "stop"
+                            else:
+                                exit_reason = "target"
+                            logger.debug(
+                                f"Trade details | {instrument} | "
+                                f"closePrice={exit_price:.5f} reason={exit_reason}"
+                            )
+
+                        # Fall back to current market price if trade details unavailable
+                        if not exit_price:
+                            price = self.client.get_price(instrument)
+                            if price:
+                                current_price = price.mid
+                                if pos_info["direction"] == Direction.LONG:
+                                    if current_price <= pos_info["stop_loss"]:
+                                        exit_reason = "stop"
+                                        exit_price = pos_info["stop_loss"]
+                                    elif current_price >= pos_info["take_profit"]:
+                                        exit_reason = "target"
+                                        exit_price = pos_info["take_profit"]
+                                    else:
+                                        exit_price = current_price
+                                else:
+                                    if current_price >= pos_info["stop_loss"]:
+                                        exit_reason = "stop"
+                                        exit_price = pos_info["stop_loss"]
+                                    elif current_price <= pos_info["take_profit"]:
+                                        exit_reason = "target"
+                                        exit_price = pos_info["take_profit"]
+                                    else:
+                                        exit_price = current_price
+
+                        if not exit_price:
+                            logger.warning(
+                                f"Could not determine exit price for {instrument}, "
+                                f"using entry price as fallback"
+                            )
+                            exit_price = pos_info["entry_price"]
+
+                        # Calculate and log PnL
+                        pnl = calculate_pnl(
+                            pos_info["direction"].value,
+                            pos_info["entry_price"],
+                            exit_price,
+                            pos_info["units"],
+                        )
+                        rr = calculate_rr_achieved(
+                            pos_info["direction"].value,
+                            pos_info["entry_price"],
+                            exit_price,
+                            pos_info["stop_loss"],
+                        )
+
+                        if pos_info["db_id"] is not None:
+                            self.trade_logger.log_exit(
+                                row_id=pos_info["db_id"],
+                                exit_price=exit_price,
+                                exit_reason=exit_reason,
+                                pnl=pnl,
+                                rr_achieved=rr,
+                            )
+                        else:
+                            logger.warning(
+                                f"EXIT NOT LOGGED | {instrument} | "
+                                f"adopted position has no db_id"
+                            )
+
+                        logger.info(
+                            f"EXIT LOGGED | {instrument} | "
+                            f"Price: {exit_price:.5f} Reason: {exit_reason} "
+                            f"PnL: {pnl:.2f} RR: {rr:.2f}"
+                        )
+                    except Exception as e:
+                        logger.error(f"Error logging exit for {instrument}: {e}")
+                    finally:
+                        # Always notify session manager so it can transition
+                        # back to WATCHING_FOR_BREAKOUT for re-entry
+                        sm = self.session_managers[instrument]
+                        sm.handle_trade_exit(pos_info["session"], exit_reason, exit_price)
+
+            except Exception as e:
+                logger.error(f"Error checking position for {instrument}: {e}", exc_info=True)
+
+    def _check_time_exits(self) -> None:
+        """Check if any positions need to be closed due to session time exit."""
+        now = self._get_current_time_ny()
+        current_time = now.time()
+
+        for instrument in list(self._open_positions.keys()):
+            pos_info = self._open_positions[instrument]
+            session = pos_info["session"]
+            config = SESSIONS[session]
+
+            # Check if it's time to close
+            should_close = False
+
+            # Handle midnight crossing for Tokyo
+            if config.range_start > config.session_close:
+                # Tokyo style: e.g. range_start=18:00, session_close=02:54
+                # Close when: past session_close AND before range_start (next session)
+                should_close = (
+                    current_time >= config.session_close
+                    and current_time < config.range_start
+                )
+            else:
+                should_close = current_time >= config.session_close
+
+            if should_close:
+                logger.info(
+                    f"TIME EXIT | {instrument} | "
+                    f"Session {session.value} closing at {current_time}"
+                )
+
+                if not self.dry_run:
+                    result = self.client.close_position(instrument)
+                    if result.success:
+                        exit_price = result.fill_price or 0
+
+                        pnl = calculate_pnl(
+                            pos_info["direction"].value,
+                            pos_info["entry_price"],
+                            exit_price,
+                            pos_info["units"],
+                        )
+                        rr = calculate_rr_achieved(
+                            pos_info["direction"].value,
+                            pos_info["entry_price"],
+                            exit_price,
+                            pos_info["stop_loss"],
+                        )
+
+                        if pos_info["db_id"] is not None:
+                            self.trade_logger.log_exit(
+                                row_id=pos_info["db_id"],
+                                exit_price=exit_price,
+                                exit_reason="time",
+                                pnl=pnl,
+                                rr_achieved=rr,
+                            )
+                        else:
+                            logger.warning(
+                                f"TIME EXIT NOT LOGGED | {instrument} | "
+                                f"adopted position has no db_id"
+                            )
+
+                        logger.info(
+                            f"TIME EXIT COMPLETE | {instrument} | "
+                            f"Exit: {exit_price:.5f} PnL: {pnl:.2f}"
+                        )
+
+                        # Notify session manager
+                        sm = self.session_managers[instrument]
+                        sm.handle_trade_exit(session, "time", exit_price)
+
+                        del self._open_positions[instrument]
+                    else:
+                        logger.error(f"Failed to close position: {result.error}")
+
+    def _process_candles(self) -> None:
+        """Fetch and process latest candles for all instruments."""
+        for instrument in self.instruments:
+            try:
+                candle = self.client.get_latest_complete_candle(
+                    instrument,
+                    TradingConfig.CANDLE_GRANULARITY,
+                )
+
+                if not candle:
+                    continue
+
+                # Skip if already processed
+                last_time = self._last_candle_times.get(instrument)
+                if last_time and candle.time <= last_time:
+                    continue
+
+                self._last_candle_times[instrument] = candle.time
+
+                logger.debug(
+                    f"Candle | {instrument} | "
+                    f"O={candle.open:.5f} H={candle.high:.5f} "
+                    f"L={candle.low:.5f} C={candle.close:.5f}"
+                )
+
+                # Process through session manager
+                sm = self.session_managers[instrument]
+                signal = sm.process_candle(candle)
+
+                # Signal handling is done via callback
+
+            except Exception as e:
+                logger.error(f"Error processing candles for {instrument}: {e}")
+
+    def _log_status(self) -> None:
+        """Log current bot status."""
+        now = self._get_current_time_ny()
+        logger.info(f"=== Status at {now.strftime('%Y-%m-%d %H:%M:%S %Z')} ===")
+
+        for instrument in self.instruments:
+            sm = self.session_managers[instrument]
+            status = sm.get_status()
+            active = sm.get_active_session()
+            active_marker = f" (active={active.value})" if active else " (active=NONE)"
+
+            for session_name, session_status in status.items():
+                logger.info(
+                    f"{instrument} | {session_name}{active_marker if session_name == (active.value if active else None) else ''} | "
+                    f"State: {session_status['state']} | "
+                    f"Trades: {session_status['trades']} | "
+                    f"Range: {session_status['opening_range'] or '-'}"
+                )
+
+        # Log pending orders
+        for instrument, pending in self._pending_orders.items():
+            logger.info(
+                f"{instrument} | PENDING ORDER | "
+                f"{pending['direction'].value} {pending['units']} units @ {pending['entry_price']:.5f} "
+                f"(order_id={pending['order_id']})"
+            )
+
+        # Log positions
+        for instrument, pos in self._open_positions.items():
+            logger.info(
+                f"{instrument} | POSITION | "
+                f"{pos['direction'].value} {pos['units']} units @ {pos['entry_price']:.5f}"
+            )
+
+    def run(self) -> None:
+        """Run the main trading loop."""
+        logger.info("=" * 60)
+        logger.info("MS-ORB Trading Bot Starting")
+        logger.info(f"Instruments: {self.instruments}")
+        logger.info(f"Environment: {TradingConfig.OANDA_ENVIRONMENT}")
+        logger.info(f"Risk per trade: {TradingConfig.RISK_PER_TRADE:.1%}")
+        logger.info(f"RR Target: {TradingConfig.RR_TARGET}")
+        logger.info(f"Max trades per session: {TradingConfig.MAX_TRADES_PER_SESSION}")
+        logger.info("=" * 60)
+
+        # Test connection
+        if not self.client.test_connection():
+            logger.error("Failed to connect to OANDA")
+            return
+
+        # Check for any existing open positions
+        for instrument in self.instruments:
+            pos = self.client.get_position(instrument)
+            if pos:
+                logger.warning(
+                    f"Existing position found: {instrument} | "
+                    f"{pos.units} units @ {pos.avg_price}"
+                )
+                self._adopt_existing_position(instrument, pos)
+
+        # If bot started mid-session (past range_end), back-fill the opening
+        # range from historical candles so we can still trade this session.
+        # Skip any instrument whose active-session context is IN_TRADE from
+        # the adoption step above.
+        for instrument in self.instruments:
+            try:
+                self.session_managers[instrument].recover_session_state()
+            except Exception as e:
+                logger.error(
+                    f"Range recovery failed for {instrument}: {e}", exc_info=True
+                )
+
+        self._running = True
+        last_status_log = datetime.now()
+        status_interval = timedelta(minutes=5)
+
+        try:
+            while self._running and not self._shutdown_requested:
+                loop_start = time.time()
+
+                try:
+                    # Process candles
+                    self._process_candles()
+
+                    # Check pending limit orders (fill/timeout)
+                    self._check_pending_orders()
+
+                    # Check positions
+                    self._check_positions()
+
+                    # Check time exits
+                    self._check_time_exits()
+
+                    # Log status periodically
+                    if datetime.now() - last_status_log > status_interval:
+                        self._log_status()
+                        last_status_log = datetime.now()
+
+                except Exception as e:
+                    logger.error(f"Error in main loop: {e}", exc_info=True)
+
+                # Sleep until next poll
+                elapsed = time.time() - loop_start
+                sleep_time = max(0, TradingConfig.PRICE_POLL_INTERVAL - elapsed)
+                time.sleep(sleep_time)
+
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received")
+        finally:
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        """Gracefully shut down the bot."""
+        logger.info("Shutting down trading bot...")
+        self._running = False
+
+        # Log final status
+        self._log_status()
+
+        # Get trade stats
+        stats = self.trade_logger.get_trade_stats()
+        logger.info(f"Trade Statistics: {stats}")
+
+        logger.info("Trading bot stopped")
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description="MS-ORB Trading Bot")
+    parser.add_argument(
+        "--instruments",
+        type=str,
+        help="Comma-separated list of instruments (e.g., XAU_USD,NAS100_USD)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run without placing real orders",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    instruments = None
+    if args.instruments:
+        instruments = [i.strip() for i in args.instruments.split(",")]
+
+    # Set up signal handlers
+    bot = TradingBot(instruments=instruments, dry_run=args.dry_run)
+
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}")
+        bot._shutdown_requested = True
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Run the bot
+    try:
+        bot.run()
+    except Exception:
+        logger.critical("FATAL: Unhandled exception", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

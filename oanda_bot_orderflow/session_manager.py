@@ -20,6 +20,7 @@ from strategy import (
     BreakoutSignal,
     RangeRecorder,
     BreakoutDetector,
+    check_order_flow,
 )
 from oanda_client import Candle, OANDAClient, Position
 
@@ -68,6 +69,9 @@ class SessionContext:
     pending_order_id: Optional[str] = None
     pending_order_time: Optional[datetime] = None
     last_candle_time: Optional[datetime] = None
+    # Order flow: store range candles and recent post-range candles
+    range_candles: list = field(default_factory=list)
+    post_range_candles: list = field(default_factory=list)
 
     @property
     def trade_count(self) -> int:
@@ -91,6 +95,8 @@ class SessionContext:
         self.pending_order_id = None
         self.pending_order_time = None
         self.last_candle_time = None
+        self.range_candles = []
+        self.post_range_candles = []
         logger.info(f"Session context reset: {self.session.value} {self.instrument}")
 
 
@@ -288,19 +294,22 @@ class SessionManager:
             if self._is_in_range_period(current_time, config):
                 ctx.state = SessionState.RECORDING_RANGE
                 ctx.range_recorder = RangeRecorder(ctx.session, self.instrument)
+                ctx.range_candles = []
                 logger.info(
                     f"[{ctx.session.value}] {self.instrument} -> RECORDING_RANGE"
                 )
                 # Add only if the candle's own start time is inside the window.
                 if self._candle_in_range_window(candle, config):
                     ctx.range_recorder.add_candle(candle)
+                    ctx.range_candles.append(candle)
 
         elif ctx.state == SessionState.RECORDING_RANGE:
-            # Add the candle only if its own NY-local start time is inside the
-            # range window. Wall-clock gating would fold in the pre-range candle
-            # that completes exactly at range_start.
+            # Add the candle (and its order-flow copy) only if its own NY-local
+            # start time is inside the range window. Wall-clock gating would fold
+            # in the pre-range candle that completes exactly at range_start.
             if self._candle_in_range_window(candle, config):
                 ctx.range_recorder.add_candle(candle)
+                ctx.range_candles.append(candle)
 
             # Finalize once wall-clock has moved past the range period.
             if not self._is_in_range_period(current_time, config):
@@ -310,6 +319,7 @@ class SessionManager:
                         ctx.opening_range,
                         rr_target=TradingConfig.RR_TARGET,
                     )
+                    ctx.post_range_candles = []
                     ctx.state = SessionState.WATCHING_FOR_BREAKOUT
                     logger.info(
                         f"[{ctx.session.value}] {self.instrument} -> WATCHING_FOR_BREAKOUT "
@@ -322,6 +332,9 @@ class SessionManager:
                     ctx.state = SessionState.SESSION_CLOSED
 
         elif ctx.state == SessionState.WATCHING_FOR_BREAKOUT:
+            # Track post-range candles for volume ramp calculation
+            ctx.post_range_candles.append(candle)
+
             # Check for time close
             if self._is_time_to_close(current_time, config):
                 ctx.state = SessionState.SESSION_CLOSED
@@ -340,6 +353,39 @@ class SessionManager:
             if ctx.can_trade and self._is_in_entry_window(current_time, config):
                 signal = ctx.breakout_detector.check_breakout(candle)
                 if signal:
+                    # Apply order flow filter before placing order
+                    if TradingConfig.USE_ORDER_FLOW_FILTER:
+                        # Get last 3 candles before breakout for volume ramp
+                        pre_breakout = ctx.post_range_candles[-4:-1] if len(ctx.post_range_candles) > 3 else ctx.post_range_candles[:-1]
+                        if not pre_breakout:
+                            pre_breakout = ctx.range_candles[-3:]
+
+                        of_result = check_order_flow(
+                            range_candles=ctx.range_candles,
+                            pre_breakout_candles=pre_breakout,
+                            direction=signal.direction,
+                            require_cvd_aligned=TradingConfig.REQUIRE_CVD_ALIGNED,
+                            min_volume_ramp=TradingConfig.MIN_VOLUME_RAMP,
+                        )
+
+                        if not of_result.passes_filter:
+                            logger.info(
+                                f"[{ctx.session.value}] {self.instrument} ORDER FLOW REJECT | "
+                                f"{signal.direction.value} @ {signal.entry_price:.5f} | "
+                                f"cvd={of_result.cvd_range:.0f} ramp={of_result.volume_ramp:.2f} | "
+                                f"{of_result.rejection_reason}"
+                            )
+                            # Reset direction so it can re-trigger if price breaks again
+                            ctx.breakout_detector.reset_direction(signal.direction)
+                            return None
+
+                        logger.info(
+                            f"[{ctx.session.value}] {self.instrument} ORDER FLOW PASS | "
+                            f"{signal.direction.value} | cvd={of_result.cvd_range:.0f} "
+                            f"aligned={'Y' if of_result.cvd_aligned else 'N'} "
+                            f"ramp={of_result.volume_ramp:.2f}"
+                        )
+
                     # Create trade record (will be finalized on fill)
                     ctx.current_trade = TradeRecord(
                         direction=signal.direction,
@@ -394,6 +440,7 @@ class SessionManager:
                 # Add only if the candle's own start time is inside the window.
                 if self._candle_in_range_window(candle, config):
                     ctx.range_recorder.add_candle(candle)
+                    ctx.range_candles.append(candle)
 
         return signal
 
@@ -666,6 +713,7 @@ class SessionManager:
             session_date = (now - _td(days=1)).date()
 
         recorder = RangeRecorder(active, self.instrument)
+        recovered_range_candles = []
         for candle in candles:
             candle_ny = candle.time.astimezone(NY_TZ)
             if candle_ny.date() != session_date:
@@ -673,6 +721,7 @@ class SessionManager:
             ct = candle_ny.time()
             if config.range_start <= ct < config.range_end:
                 recorder.add_candle(candle)
+                recovered_range_candles.append(candle)
 
         opening_range = recorder.finalize()
         if opening_range is None:
@@ -684,6 +733,8 @@ class SessionManager:
             return
 
         ctx.range_recorder = recorder
+        ctx.range_candles = recovered_range_candles
+        ctx.post_range_candles = []
         ctx.opening_range = opening_range
         ctx.breakout_detector = BreakoutDetector(
             opening_range,

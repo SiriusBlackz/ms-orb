@@ -1,0 +1,33 @@
+[Unit]
+Description=MS-ORB OANDA Trading Bot (Order Flow Variant)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=msorbbot
+Group=msorbbot
+WorkingDirectory=/opt/ms-orb-oanda-orderflow
+EnvironmentFile=/opt/ms-orb-oanda-orderflow/.env
+
+ExecStart=/opt/ms-orb-oanda-orderflow/venv/bin/python3 main.py
+
+# Logging
+StandardOutput=append:/var/log/ms-orb-oanda-orderflow.log
+StandardError=append:/var/log/ms-orb-oanda-orderflow.log
+
+# Auto-restart on failure
+Restart=on-failure
+RestartSec=30
+
+# Safety limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ms-orb-oanda-orderflow /var/log/ms-orb-oanda-orderflow.log
+
+[Install]
+WantedBy=multi-user.target

@@ -15,6 +15,10 @@ __pycache__/
 # Logs
 logs/
 
+# Backtest data caches and chart screenshots (kept out of git, like the base bot)
+cache/
+Evidence/
+
 # IDE
 .vscode/
 .idea/

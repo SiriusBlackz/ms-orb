@@ -1,0 +1,33 @@
+[Unit]
+Description=MS-ORB OANDA Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=msorbbot
+Group=msorbbot
+WorkingDirectory=/opt/ms-orb-oanda
+EnvironmentFile=/opt/ms-orb-oanda/.env
+
+ExecStart=/opt/ms-orb-oanda/venv/bin/python3 main.py
+
+# Logging
+StandardOutput=append:/var/log/ms-orb-oanda.log
+StandardError=append:/var/log/ms-orb-oanda.log
+
+# Auto-restart on failure
+Restart=on-failure
+RestartSec=30
+
+# Safety limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ms-orb-oanda /var/log/ms-orb-oanda.log
+
+[Install]
+WantedBy=multi-user.target
