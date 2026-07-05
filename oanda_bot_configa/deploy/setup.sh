@@ -13,10 +13,17 @@ LOG_FILE="/var/log/ms-orb-configa.log"
 
 echo "=== MS-ORB Config-A Bot - Server Setup ==="
 
-# Install system dependencies (no-op if already present from the base bot)
+# Install system dependencies (no-op if already present from the base bot).
+# Non-fatal: this droplet has a broken apt post-invoke hook (command-not-found
+# missing apt_pkg) that fails `apt-get update` even when the package work
+# succeeded. The venv step below fails loudly if python3-venv is truly absent.
 echo "[1/6] Installing system packages..."
-apt-get update -qq
-apt-get install -y -qq python3 python3-pip python3-venv sqlite3 > /dev/null
+if ! apt-get update -qq; then
+    echo "  WARNING: apt-get update exited non-zero (continuing; deps likely already installed)"
+fi
+if ! apt-get install -y -qq python3 python3-pip python3-venv sqlite3 > /dev/null; then
+    echo "  WARNING: apt-get install exited non-zero (continuing; venv step will catch real gaps)"
+fi
 
 # Create non-root service user (no login shell)
 echo "[2/6] Creating service user '$APP_USER'..."
