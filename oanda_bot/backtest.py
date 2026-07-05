@@ -77,13 +77,15 @@ class TradeResult:
     take_profit: float
     exit_price: float
     exit_reason: str       # "stop", "target", "time"
-    rr_achieved: float
+    rr_achieved: float     # net of costs when a cost model is active
     entry_time: datetime
     exit_time: datetime
     vol_threshold: Optional[float] = None
     adx_threshold: Optional[float] = None
     breakout_volume_ratio: Optional[float] = None
     breakout_adx: Optional[float] = None
+    rr_gross: float = 0.0  # RR before costs
+    cost_r: float = 0.0    # round-trip cost in R units (at 1x cost multiplier)
 
 
 @dataclass
@@ -269,6 +271,43 @@ def compute_adx_series(candles: list[Candle], period: int = 14) -> dict[datetime
                 adx_series[candles[candle_idx].time] = adx
 
     return adx_series
+
+
+def compute_atr_series(candles: list[Candle], period: int = 14) -> dict[datetime, float]:
+    """Wilder ATR per candle.time. Uses prior close for true range.
+
+    Identical to backtest_research.compute_atr_series — the ATR that
+    defines the Config-A stop width must match the research dataset.
+    """
+    out: dict[datetime, float] = {}
+    trs: list[float] = []
+    prev_close: Optional[float] = None
+    atr: Optional[float] = None
+    for i, c in enumerate(candles):
+        if prev_close is None:
+            tr = c.high - c.low
+        else:
+            tr = max(c.high - c.low, abs(c.high - prev_close), abs(c.low - prev_close))
+        trs.append(tr)
+        if i + 1 == period:
+            atr = sum(trs[:period]) / period
+            out[c.time] = atr
+        elif i + 1 > period:
+            atr = (atr * (period - 1) + tr) / period
+            out[c.time] = atr
+        prev_close = c.close
+    return out
+
+
+def compute_ema_series(candles: list[Candle], period: int) -> dict[datetime, float]:
+    """EMA of close per candle.time (matches backtest_research)."""
+    out: dict[datetime, float] = {}
+    k = 2 / (period + 1)
+    ema: Optional[float] = None
+    for c in candles:
+        ema = c.close if ema is None else (c.close * k + ema * (1 - k))
+        out[c.time] = ema
+    return out
 
 
 # ─────────────────────────────────────────────────────────────
@@ -627,6 +666,13 @@ def run_simulation(
     vol_lookback: int = 20,
     max_trades_per_session: int = 2,
     verbose: bool = False,
+    stop_mode: str = "candle",
+    atr_stop_mult: float = 1.5,
+    first_breakout_only: bool = False,
+    htf_align: bool = False,
+    atr_series: Optional[dict[datetime, float]] = None,
+    ema_htf_series: Optional[dict[datetime, float]] = None,
+    cost_price: float = 0.0,
 ) -> SimulationMetrics:
     """Run the full backtest simulation for one filter combination.
 
@@ -637,9 +683,25 @@ def run_simulation(
     4. Simulate trades (fixed SL, no BE)
     5. Allow re-entry after stop-out up to max_trades_per_session
 
+    Config-A extensions (all default-off; defaults reproduce the classic
+    candle-stop grid exactly):
+    - stop_mode="atr": SL = entry -/+ atr_stop_mult * ATR14 (Wilder, full
+      stream; falls back to range size during ATR warm-up, matching
+      backtest_research). TP = entry +/- rr_target * risk.
+    - first_breakout_only: only the session's FIRST breakout signal is
+      eligible (research seq==0). If it is filtered out, the session is
+      skipped entirely — no later entries, no re-entry after a stop.
+    - htf_align: require breakout-candle close on the trend side of
+      EMA100 (close > EMA100 for LONG, < for SHORT); missing EMA counts
+      as not aligned (matches research).
+    - cost_price: round-trip cost in price units, converted to R per
+      trade and subtracted from rr_achieved (rr_gross keeps the raw RR).
+
     Returns SimulationMetrics with all trade results.
     """
     metrics = SimulationMetrics(vol_threshold=vol_threshold, adx_threshold=adx_threshold)
+    atr_series = atr_series or {}
+    ema_htf_series = ema_htf_series or {}
 
     sorted_items = sorted(grouped_candles.items(), key=lambda kv: (kv[0][1], kv[0][0].value))
 
@@ -697,6 +759,8 @@ def run_simulation(
                 # Apply volume filter
                 if vol_threshold is not None:
                     if vol_ratio is None or vol_ratio < vol_threshold:
+                        if first_breakout_only:
+                            break
                         detector.reset_direction(signal.direction)
                         i += 1
                         continue
@@ -704,11 +768,53 @@ def run_simulation(
                 # Apply ADX filter
                 if adx_threshold is not None:
                     if adx_value is None or adx_value < adx_threshold:
+                        if first_breakout_only:
+                            break
                         detector.reset_direction(signal.direction)
                         i += 1
                         continue
 
-                # Both filters pass — simulate trade
+                # Apply HTF trend alignment (close vs EMA100 at the breakout candle)
+                if htf_align:
+                    ema_htf = ema_htf_series.get(candle.time)
+                    aligned = ema_htf is not None and (
+                        (signal.direction == Direction.LONG and candle.close > ema_htf)
+                        or (signal.direction == Direction.SHORT and candle.close < ema_htf)
+                    )
+                    if not aligned:
+                        if first_breakout_only:
+                            break
+                        detector.reset_direction(signal.direction)
+                        i += 1
+                        continue
+
+                # ATR stop mode: rebuild SL/TP off a volatility stop instead of
+                # the breakout candle's extreme
+                if stop_mode == "atr":
+                    atr = atr_series.get(candle.time)
+                    range_size = opening_range.high - opening_range.low
+                    stop_dist = atr_stop_mult * (atr if atr else range_size)
+                    if signal.direction == Direction.LONG:
+                        sl_price = signal.entry_price - stop_dist
+                        tp_price = signal.entry_price + rr_target * stop_dist
+                    else:
+                        sl_price = signal.entry_price + stop_dist
+                        tp_price = signal.entry_price - rr_target * stop_dist
+                    signal = BreakoutSignal(
+                        session=signal.session,
+                        instrument=signal.instrument,
+                        direction=signal.direction,
+                        entry_price=signal.entry_price,
+                        stop_loss=sl_price,
+                        take_profit=tp_price,
+                        opening_range=signal.opening_range,
+                        signal_time=signal.signal_time,
+                        breakout_candle=signal.breakout_candle,
+                        risk_per_unit=stop_dist,
+                        rr_target=rr_target,
+                    )
+
+                # All filters pass — simulate trade
                 remaining_candles = post_range_candles[i + 1:]
                 result = simulate_trade(signal, remaining_candles, session_cfg)
 
@@ -717,11 +823,19 @@ def run_simulation(
                     result.adx_threshold = adx_threshold
                     result.breakout_volume_ratio = vol_ratio
                     result.breakout_adx = adx_value
+                    result.rr_gross = result.rr_achieved
+                    if cost_price > 0 and signal.risk_per_unit > 0:
+                        result.cost_r = cost_price / signal.risk_per_unit
+                        result.rr_achieved = result.rr_gross - result.cost_r
                     metrics.trades.append(result)
                     trades_taken += 1
 
                     if verbose:
                         _print_trade(result)
+
+                    if first_breakout_only:
+                        # Config-A semantics: one shot per session, no re-entry
+                        break
 
                     # If stopped out, allow re-entry
                     if result.exit_reason == "stop":
@@ -966,6 +1080,83 @@ def print_best_config(
     print(f"{'*' * 60}")
 
 
+def print_equity_report(metrics: SimulationMetrics, cost_mults: tuple[float, ...] = (1.0, 1.5, 2.0)) -> None:
+    """Monthly R breakdown, equity-curve stats, and cost-sensitivity table.
+
+    Cost sensitivity recomputes every trade as rr_gross - mult * cost_r,
+    so it is exact, not an approximation.
+    """
+    trades = sorted(metrics.trades, key=lambda t: t.entry_time)
+    if not trades:
+        print("\nNo trades — equity report skipped.")
+        return
+
+    print("\n" + "=" * 90)
+    print("  EQUITY REPORT")
+    print("=" * 90)
+
+    # Monthly breakdown (net R, per instrument and combined)
+    instruments = sorted({t.instrument for t in trades})
+    months: dict[str, dict[str, float]] = {}
+    for t in trades:
+        mkey = t.entry_time.strftime("%Y-%m")
+        row = months.setdefault(mkey, {i: 0.0 for i in instruments})
+        row[t.instrument] += t.rr_achieved
+    header = f"{'Month':>8s} │ " + " │ ".join(f"{i:>11s}" for i in instruments) + f" │ {'Total':>8s}"
+    print(header)
+    print("─" * len(header))
+    pos_months = 0
+    for mkey in sorted(months):
+        row = months[mkey]
+        total = sum(row.values())
+        pos_months += total > 0
+        cells = " │ ".join(f"{row[i]:>+11.2f}" for i in instruments)
+        print(f"{mkey:>8s} │ {cells} │ {total:>+8.2f}")
+    print("─" * len(header))
+    print(f"Positive months: {pos_months}/{len(months)}")
+
+    # Equity curve stats (in R, chronological)
+    equity = peak = max_dd = 0.0
+    dd_start = dd_trough_date = None
+    worst_dd_window = None
+    for t in trades:
+        equity += t.rr_achieved
+        if equity > peak:
+            peak = equity
+            dd_start = t.trade_date
+        dd = peak - equity
+        if dd > max_dd:
+            max_dd = dd
+            worst_dd_window = (dd_start, t.trade_date)
+        dd_trough_date = t.trade_date
+    print(f"\nTotal R (net):        {sum(t.rr_achieved for t in trades):+.2f}")
+    print(f"Total R (gross):      {sum(t.rr_gross for t in trades):+.2f}")
+    print(f"Expectancy / trade:   {sum(t.rr_achieved for t in trades) / len(trades):+.3f}R  (n={len(trades)})")
+    print(f"Max drawdown:         {max_dd:.2f}R"
+          + (f"  ({worst_dd_window[0]} → {worst_dd_window[1]})" if worst_dd_window and worst_dd_window[0] else ""))
+    print(f"Max consec losses:    {metrics.max_consecutive_losses}")
+    print(f"At 0.5% risk/trade:   maxDD ≈ {max_dd * 0.5:.1f}% of account · year ≈ {sum(t.rr_achieved for t in trades) * 0.5:+.1f}%")
+
+    # Cost sensitivity
+    if any(t.cost_r > 0 for t in trades):
+        print(f"\n{'Cost mult':>10s} │ {'Total R':>8s} │ {'exp/trade':>9s} │ {'Win%':>6s} │ {'PF':>6s} │ {'MaxDD(R)':>8s}")
+        print("─" * 62)
+        for mult in cost_mults:
+            rs = [t.rr_gross - mult * t.cost_r for t in trades]
+            wins = sum(1 for r in rs if r > 0)
+            gp = sum(r for r in rs if r > 0)
+            gl = abs(sum(r for r in rs if r <= 0))
+            pf = gp / gl if gl > 0 else float("inf")
+            eq = pk = mdd = 0.0
+            for r in rs:
+                eq += r
+                pk = max(pk, eq)
+                mdd = max(mdd, pk - eq)
+            print(f"{mult:>9.1f}x │ {sum(rs):>+8.2f} │ {sum(rs)/len(rs):>+9.3f} │ "
+                  f"{wins/len(rs):>5.1%} │ {pf:>6.2f} │ {mdd:>8.2f}")
+    print("=" * 90)
+
+
 # ─────────────────────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────────────────────
@@ -1019,7 +1210,58 @@ def parse_args() -> argparse.Namespace:
         "--verbose", action="store_true",
         help="Print individual trade details",
     )
+    parser.add_argument(
+        "--stop-mode", choices=["candle", "atr"], default="candle",
+        help="SL placement: breakout-candle extreme (default) or ATR14 multiple",
+    )
+    parser.add_argument(
+        "--atr-stop-mult", type=float, default=1.5,
+        help="ATR multiple for --stop-mode atr (default: 1.5)",
+    )
+    parser.add_argument(
+        "--first-breakout", action="store_true",
+        help="Only the session's first breakout signal is eligible (no re-entry)",
+    )
+    parser.add_argument(
+        "--htf-align", action="store_true",
+        help="Require breakout close on the trend side of EMA100",
+    )
+    parser.add_argument(
+        "--cost", type=str, default=None,
+        help="Round-trip cost in price units: 'default' (XAU 0.35, NAS100 1.5) "
+             "or 'XAU_USD=0.35,NAS100_USD=1.5'",
+    )
+    parser.add_argument(
+        "--equity-report", action="store_true",
+        help="Print monthly R breakdown, equity stats, and cost sensitivity",
+    )
+    parser.add_argument(
+        "--config-a", action="store_true",
+        help="Preset: the validated Tokyo bracket portfolio (XAU+NAS Tokyo, "
+             "first breakout, HTF-aligned, 1.5xATR stop, 3:1, costed). "
+             "Equivalent to --sessions TOKYO --rr-target 3.0 --stop-mode atr "
+             "--first-breakout --htf-align --vol-filter None --adx-filter None "
+             "--cost default --equity-report",
+    )
     return parser.parse_args()
+
+
+DEFAULT_COST_PRICE = {"XAU_USD": 0.35, "NAS100_USD": 1.5}
+
+
+def _parse_cost_spec(raw: Optional[str]) -> dict[str, float]:
+    """Parse --cost into {instrument: round-trip price cost}."""
+    if not raw:
+        return {}
+    if raw.strip().lower() == "default":
+        return dict(DEFAULT_COST_PRICE)
+    out: dict[str, float] = {}
+    for token in raw.split(","):
+        inst, _, val = token.strip().partition("=")
+        if not val:
+            raise ValueError(f"Bad --cost token: {token!r} (want INSTRUMENT=price)")
+        out[inst] = float(val)
+    return out
 
 
 def main() -> None:
@@ -1032,6 +1274,19 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # --config-a preset expands to the validated Tokyo bracket portfolio
+    if args.config_a:
+        args.sessions = "TOKYO"
+        args.rr_target = 3.0
+        args.stop_mode = "atr"
+        args.atr_stop_mult = 1.5
+        args.first_breakout = True
+        args.htf_align = True
+        args.vol_filter = "None"
+        args.adx_filter = "None"
+        args.cost = args.cost or "default"
+        args.equity_report = True
 
     # Parse instruments and sessions
     instruments = [s.strip() for s in args.instruments.split(",")]
@@ -1057,11 +1312,17 @@ def main() -> None:
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=args.months * 30)
 
+    cost_spec = _parse_cost_spec(args.cost)
+
     print(f"\nMS-ORB Backtest: Volume & ADX Filter Optimization")
     print(f"  Period:      {start_dt.date()} to {end_dt.date()} ({args.months} months)")
     print(f"  Instruments: {', '.join(instruments)}")
     print(f"  Sessions:    {', '.join(s.value for s in session_names)}")
     print(f"  RR Target:   {args.rr_target}")
+    print(f"  Stop mode:   {args.stop_mode}"
+          + (f" ({args.atr_stop_mult}xATR)" if args.stop_mode == "atr" else ""))
+    print(f"  First-only:  {args.first_breakout}   HTF-align: {args.htf_align}")
+    print(f"  Costs:       {cost_spec or 'off (gross RR)'}")
     print(f"  Vol filters: {['Off' if v is None else v for v in vol_thresholds]}")
     print(f"  ADX filters: {['Off' if a is None else a for a in adx_thresholds]}")
     print(f"  Combos:      {len(combos)}")
@@ -1094,6 +1355,17 @@ def main() -> None:
         adx_series = compute_adx_series(candles)
         instrument_adx[inst] = adx_series
         print(f"  {inst}: ADX computed for {len(adx_series)} candles")
+
+    # Pre-compute ATR14 / EMA100 series when the ATR stop or HTF filter is active
+    instrument_atr: dict[str, dict[datetime, float]] = {}
+    instrument_ema100: dict[str, dict[datetime, float]] = {}
+    if args.stop_mode == "atr" or args.htf_align:
+        for inst, candles in instrument_candles.items():
+            if args.stop_mode == "atr":
+                instrument_atr[inst] = compute_atr_series(candles)
+            if args.htf_align:
+                instrument_ema100[inst] = compute_ema_series(candles, 100)
+            print(f"  {inst}: ATR/EMA100 series computed")
 
     # Group candles by session day (per instrument)
     instrument_groups: dict[str, dict[tuple[SessionName, date], list[Candle]]] = {}
@@ -1128,6 +1400,13 @@ def main() -> None:
                 adx_series=instrument_adx.get(inst, {}),
                 max_trades_per_session=TradingConfig.MAX_TRADES_PER_SESSION,
                 verbose=args.verbose,
+                stop_mode=args.stop_mode,
+                atr_stop_mult=args.atr_stop_mult,
+                first_breakout_only=args.first_breakout,
+                htf_align=args.htf_align,
+                atr_series=instrument_atr.get(inst),
+                ema_htf_series=instrument_ema100.get(inst),
+                cost_price=cost_spec.get(inst, 0.0),
             )
             combined_metrics.trades.extend(m.trades)
 
@@ -1152,6 +1431,9 @@ def main() -> None:
         print_detail_breakdown(best_metrics, instruments, session_names)
 
     print_best_config(best_vol, best_adx, all_metrics)
+
+    if args.equity_report and best_metrics:
+        print_equity_report(best_metrics)
 
 
 if __name__ == "__main__":
