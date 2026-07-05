@@ -12,5 +12,7 @@ pytz>=2024.1
 # For type hints (Python 3.9+)
 typing-extensions>=4.0.0
 
-# oandapyV20 declares no dependencies in its metadata but imports requests
+# oandapyV20 declares no dependencies in its metadata but imports requests+six
+# (verified complete: those are its only two non-stdlib imports)
 requests>=2.31.0
+six>=1.16.0
