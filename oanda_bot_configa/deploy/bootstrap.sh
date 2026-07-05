@@ -82,7 +82,7 @@ ENV
 echo "=== [3/5] Syncing code ==="
 rsync -az --delete \
     -e "ssh -o ControlMaster=auto -o ControlPath=$CTRL -o ControlPersist=120" \
-    --exclude '.env' --exclude '__pycache__' --exclude '*.pyc' \
+    --exclude '.env' --exclude 'venv/' --exclude '__pycache__' --exclude '*.pyc' \
     --exclude 'deploy/' --exclude 'trades.db' --exclude 'logs/' --exclude '.git' \
     "$BOT_DIR/" "$SSH_USER@$SERVER:$APP_DIR/"
 
