@@ -1,0 +1,33 @@
+[Unit]
+Description=MS-ORB cTrader Trading Bot (Config-A on cTrader Open API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=msorbbot
+Group=msorbbot
+WorkingDirectory=/opt/ms-orb-ctrader
+EnvironmentFile=/opt/ms-orb-ctrader/.env
+
+ExecStart=/opt/ms-orb-ctrader/venv/bin/python3 main.py
+
+# Logging
+StandardOutput=append:/var/log/ms-orb-ctrader.log
+StandardError=append:/var/log/ms-orb-ctrader.log
+
+# Auto-restart on failure
+Restart=on-failure
+RestartSec=30
+
+# Safety limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ms-orb-ctrader /var/log/ms-orb-ctrader.log
+
+[Install]
+WantedBy=multi-user.target

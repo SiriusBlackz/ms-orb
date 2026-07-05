@@ -1,0 +1,15 @@
+# MS-ORB cTrader Bot Dependencies
+# (JSON-over-WebSocket transport — deliberately NOT using the dormant
+#  ctrader-open-api SDK with its Twisted/protobuf==3.20.1 pins)
+
+# WebSocket transport to demo/live.ctraderapi.com:5036
+websockets>=12.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Timezone handling
+pytz>=2024.1
+
+# For type hints (Python 3.9+)
+typing-extensions>=4.0.0
