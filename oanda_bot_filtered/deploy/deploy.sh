@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Deploy (or update) MS-ORB OANDA bot to DigitalOcean droplet.
+# Deploy (or update) MS-ORB filtered OANDA bot to DigitalOcean droplet.
 # Usage: SERVER=1.2.3.4 bash deploy.sh
 #    or: bash deploy.sh 1.2.3.4
 set -euo pipefail
 
 SERVER="${1:-${SERVER:-}}"
 SSH_USER="${SSH_USER:-root}"
-APP_DIR="/opt/ms-orb-oanda"
+APP_DIR="/opt/ms-orb-oanda-filtered"
+SERVICE_NAME="ms-orb-filtered"
 BOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [ -z "$SERVER" ]; then
@@ -16,7 +17,7 @@ if [ -z "$SERVER" ]; then
     exit 1
 fi
 
-echo "=== Deploying MS-ORB OANDA Bot ==="
+echo "=== Deploying MS-ORB Filtered OANDA Bot ==="
 echo "Server:  $SSH_USER@$SERVER"
 echo "Source:  $BOT_DIR"
 echo "Remote:  $APP_DIR"
@@ -55,15 +56,15 @@ fi
 
 # Restart service
 echo "[4/4] Restarting service..."
-ssh "$SSH_USER@$SERVER" "systemctl daemon-reload && systemctl restart ms-orb-oanda"
+ssh "$SSH_USER@$SERVER" "systemctl daemon-reload && systemctl restart $SERVICE_NAME"
 
 # Quick status check
 echo ""
 echo "=== Deploy complete! Checking status... ==="
-ssh "$SSH_USER@$SERVER" "sleep 2 && systemctl status ms-orb-oanda --no-pager -l" || true
+ssh "$SSH_USER@$SERVER" "sleep 2 && systemctl status $SERVICE_NAME --no-pager -l" || true
 
 echo ""
 echo "Useful commands:"
-echo "  Logs:    ssh $SSH_USER@$SERVER 'journalctl -u ms-orb-oanda -f'"
-echo "  Status:  ssh $SSH_USER@$SERVER 'systemctl status ms-orb-oanda'"
-echo "  Stop:    ssh $SSH_USER@$SERVER 'systemctl stop ms-orb-oanda'"
+echo "  Logs:    ssh $SSH_USER@$SERVER 'journalctl -u $SERVICE_NAME -f'"
+echo "  Status:  ssh $SSH_USER@$SERVER 'systemctl status $SERVICE_NAME'"
+echo "  Stop:    ssh $SSH_USER@$SERVER 'systemctl stop $SERVICE_NAME'"

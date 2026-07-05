@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# First-time server setup for MS-ORB OANDA bot.
+# First-time server setup for MS-ORB filtered OANDA bot.
 # Run this on the droplet as root: bash setup.sh
 set -euo pipefail
 
 APP_USER="msorbbot"
-APP_DIR="/opt/ms-orb-oanda"
-LOG_FILE="/var/log/ms-orb-oanda.log"
+APP_DIR="/opt/ms-orb-oanda-filtered"
+SERVICE_NAME="ms-orb-filtered"
+LOG_FILE="/var/log/ms-orb-filtered.log"
 
-echo "=== MS-ORB OANDA Bot - Server Setup ==="
+echo "=== MS-ORB Filtered OANDA Bot - Server Setup ==="
 
 # Install system dependencies
 echo "[1/6] Installing system packages..."
@@ -39,9 +40,9 @@ sudo -u "$APP_USER" python3 -m venv "$APP_DIR/venv"
 
 # Install systemd service
 echo "[6/6] Installing systemd service..."
-cp "$(dirname "$0")/ms-orb-oanda.service" /etc/systemd/system/
+cp "$(dirname "$0")/$SERVICE_NAME.service" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable ms-orb-oanda.service
+systemctl enable "$SERVICE_NAME.service"
 
 echo ""
 echo "=== Setup complete! ==="
@@ -50,6 +51,6 @@ echo "Next steps:"
 echo "  1. Create .env file:  nano $APP_DIR/.env"
 echo "     (use .env.example as template)"
 echo "  2. Deploy code:       bash deploy.sh"
-echo "  3. Start the bot:     systemctl start ms-orb-oanda"
-echo "  4. Check status:      systemctl status ms-orb-oanda"
-echo "  5. View logs:         journalctl -u ms-orb-oanda -f"
+echo "  3. Start the bot:     systemctl start $SERVICE_NAME"
+echo "  4. Check status:      systemctl status $SERVICE_NAME"
+echo "  5. View logs:         journalctl -u $SERVICE_NAME -f"
