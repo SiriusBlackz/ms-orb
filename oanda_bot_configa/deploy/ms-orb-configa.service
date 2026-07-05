@@ -1,0 +1,33 @@
+[Unit]
+Description=MS-ORB Config-A Trading Bot (Tokyo bracket portfolio forward test)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=msorbbot
+Group=msorbbot
+WorkingDirectory=/opt/ms-orb-configa
+EnvironmentFile=/opt/ms-orb-configa/.env
+
+ExecStart=/opt/ms-orb-configa/venv/bin/python3 main.py
+
+# Logging
+StandardOutput=append:/var/log/ms-orb-configa.log
+StandardError=append:/var/log/ms-orb-configa.log
+
+# Auto-restart on failure
+Restart=on-failure
+RestartSec=30
+
+# Safety limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ms-orb-configa /var/log/ms-orb-configa.log
+
+[Install]
+WantedBy=multi-user.target
