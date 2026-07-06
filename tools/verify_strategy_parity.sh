@@ -14,6 +14,7 @@ python3 "$ROOT_DIR/oanda_bot_orderflow/test_session_manager.py"
 python3 "$ROOT_DIR/oanda_bot_configa/test_session_manager.py"
 python3 "$ROOT_DIR/ctrader_bot/test_session_manager.py"
 python3 "$ROOT_DIR/ctrader_bot/test_ctrader_client.py"
+python3 "$ROOT_DIR/ibkr_bot/test_session_manager.py"
 
 echo "[2/3] Checking authoritative backtest re-entry gate..."
 rg -q 'if result\.exit_reason == "stop":' "$ROOT_DIR/oanda_bot/backtest.py"

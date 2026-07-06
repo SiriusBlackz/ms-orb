@@ -27,6 +27,7 @@ echo ""
 echo "[1/5] Syncing code to server..."
 rsync -avz --delete \
     --exclude '.env' \
+    --exclude 'venv/' \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude 'deploy/' \

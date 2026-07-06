@@ -1,6 +1,10 @@
-"""Configuration for MS-ORB IBKR trading bot.
+"""Configuration for the MS-ORB IBKR bot — Config-A strategy on TSLA.
 
-TSLA only, NY session only. All times in New York timezone.
+TSLA only, NY session only. Config A (validated in oanda_bot/backtest.py
+--config-a and on 4 years of TSLA 5-min data): first breakout only, HTF
+EMA100-aligned, 1.5xATR14 stop, 3:1 reward:risk.
+
+All times in New York timezone.
 """
 
 import os
@@ -70,8 +74,21 @@ class TradingConfig:
 
     # Risk management
     RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% of account
-    RR_TARGET: float = float(os.getenv("RR_TARGET", "5.0"))  # Risk-reward ratio
-    MAX_TRADES_PER_SESSION: int = int(os.getenv("MAX_TRADES_PER_SESSION", "2"))
+    RR_TARGET: float = float(os.getenv("RR_TARGET", "3.0"))  # Risk-reward ratio
+    MAX_TRADES_PER_SESSION: int = int(os.getenv("MAX_TRADES_PER_SESSION", "1"))
+
+    # Config-A strategy rules (must match backtest.py --config-a)
+    STOP_MODE: str = os.getenv("STOP_MODE", "atr")  # 'atr' or 'candle'
+    ATR_STOP_MULT: float = float(os.getenv("ATR_STOP_MULT", "1.5"))
+    ATR_PERIOD: int = int(os.getenv("ATR_PERIOD", "14"))
+    HTF_ALIGN: bool = os.getenv("HTF_ALIGN", "true").lower() in ("1", "true", "yes")
+    HTF_EMA_PERIOD: int = int(os.getenv("HTF_EMA_PERIOD", "100"))
+    FIRST_BREAKOUT_ONLY: bool = os.getenv("FIRST_BREAKOUT_ONLY", "true").lower() in ("1", "true", "yes")
+    # IBKR duration string for the indicator fetch. RTH-only 5-min bars
+    # (useRTH=True in ibkr_client) match the backtest's RTH dataset; 20
+    # calendar days ~= 14 trading days ~= 1,090 bars — EMA100/ATR14 fully
+    # converged, one reqHistoricalData call.
+    INDICATOR_CANDLE_DURATION: str = os.getenv("INDICATOR_CANDLE_DURATION", "20 D")
 
     # Polling intervals
     PRICE_POLL_INTERVAL: int = int(os.getenv("PRICE_POLL_INTERVAL", "10"))  # seconds
@@ -91,6 +108,10 @@ class TradingConfig:
             errors.append(f"RISK_PER_TRADE must be between 0 and 0.1, got: {cls.RISK_PER_TRADE}")
         if cls.RR_TARGET <= 0:
             errors.append(f"RR_TARGET must be positive, got: {cls.RR_TARGET}")
+        if cls.STOP_MODE not in ("atr", "candle"):
+            errors.append(f"STOP_MODE must be 'atr' or 'candle', got: {cls.STOP_MODE}")
+        if cls.ATR_STOP_MULT <= 0:
+            errors.append(f"ATR_STOP_MULT must be positive, got: {cls.ATR_STOP_MULT}")
         if cls.IBKR_PORT not in (7496, 7497, 4001, 4002):
             errors.append(f"IBKR_PORT should be 7496/7497 (TWS) or 4001/4002 (Gateway), got: {cls.IBKR_PORT}")
 
