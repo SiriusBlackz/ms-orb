@@ -31,7 +31,7 @@ rsync -avz --delete \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude 'deploy/' \
-    --exclude 'trades.db' \
+    --exclude '*.db' \
     --exclude 'logs/' \
     --exclude '.git' \
     "$BOT_DIR/" "$SSH_USER@$SERVER:$APP_DIR/"
