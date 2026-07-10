@@ -264,24 +264,33 @@ class CTraderConnection:
         attempt = 0
         while not self._stopping:
             try:
-                ssl_ctx = ssl.create_default_context()
+                # certifi CA bundle: macOS python.org builds (and some minimal
+                # Linux images) can't see system roots from Python.
+                import certifi
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
                 async with websockets.connect(
                         self.url, ssl=ssl_ctx, ping_interval=None,
                         max_size=16 * 1024 * 1024) as ws:
                     self._ws = ws
                     logger.info(f"cTrader WebSocket connected: {self.url}")
-                    await self._authorize()
-                    await self._resolve_symbols()
-                    await self._subscribe_spots()
-                    attempt = 0
-                    self.ready.set()
-                    heartbeat = asyncio.ensure_future(self._heartbeat_loop())
+                    # The read loop must be running BEFORE the first request:
+                    # it is what resolves the response futures _request awaits.
+                    reader = asyncio.ensure_future(self._read_loop())
+                    heartbeat = None
                     try:
-                        await self._read_loop()
+                        await self._authorize()
+                        await self._resolve_symbols()
+                        await self._subscribe_spots()
+                        attempt = 0
+                        self.ready.set()
+                        heartbeat = asyncio.ensure_future(self._heartbeat_loop())
+                        await reader
                     finally:
-                        heartbeat.cancel()
+                        reader.cancel()
+                        if heartbeat is not None:
+                            heartbeat.cancel()
             except Exception as e:
-                logger.error(f"cTrader connection error: {e}")
+                logger.error(f"cTrader connection error: {e!r}")
             self.ready.clear()
             self._ws = None
             self._fail_all_pending("connection lost")

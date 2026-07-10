@@ -13,3 +13,4 @@ pytz>=2024.1
 
 # For type hints (Python 3.9+)
 typing-extensions>=4.0.0
+certifi
