@@ -669,6 +669,7 @@ def run_simulation(
     stop_mode: str = "candle",
     atr_stop_mult: float = 1.5,
     first_breakout_only: bool = False,
+    after_first_fail: bool = False,
     htf_align: bool = False,
     atr_series: Optional[dict[datetime, float]] = None,
     ema_htf_series: Optional[dict[datetime, float]] = None,
@@ -691,6 +692,12 @@ def run_simulation(
     - first_breakout_only: only the session's FIRST breakout signal is
       eligible (research seq==0). If it is filtered out, the session is
       skipped entirely — no later entries, no re-entry after a stop.
+    - after_first_fail: the session's first tradeable breakout is only
+      OBSERVED (shadow trade, not counted). If the shadow stops out, the
+      next breakout signal (same-direction re-break or opposite break)
+      becomes the session's single real trade. If the shadow hits target
+      or time-exits, the session takes no trade. Mutually exclusive with
+      first_breakout_only.
     - htf_align: require breakout-candle close on the trend side of
       EMA100 (close > EMA100 for LONG, < for SHORT); missing EMA counts
       as not aligned (matches research).
@@ -699,6 +706,9 @@ def run_simulation(
 
     Returns SimulationMetrics with all trade results.
     """
+    if first_breakout_only and after_first_fail:
+        raise ValueError("first_breakout_only and after_first_fail are mutually exclusive")
+
     metrics = SimulationMetrics(vol_threshold=vol_threshold, adx_threshold=adx_threshold)
     atr_series = atr_series or {}
     ema_htf_series = ema_htf_series or {}
@@ -737,6 +747,7 @@ def run_simulation(
         # 2. Detect breakouts and simulate trades
         detector = BreakoutDetector(opening_range, rr_target=rr_target)
         trades_taken = 0
+        shadow_pending = after_first_fail
 
         # Walk through post-range candles one at a time
         i = 0
@@ -818,6 +829,22 @@ def run_simulation(
                 remaining_candles = post_range_candles[i + 1:]
                 result = simulate_trade(signal, remaining_candles, session_cfg)
 
+                if shadow_pending:
+                    # after_first_fail: the first tradeable breakout is only
+                    # observed. A stop-out unlocks the single real entry;
+                    # anything else (target, time exit, unresolvable) closes
+                    # the session with no trade taken.
+                    shadow_pending = False
+                    if result is None or result.exit_reason != "stop":
+                        break
+                    if verbose:
+                        print("  [shadow 1st breakout — stopped out, real entry unlocked]")
+                    detector.reset_direction(result.direction)
+                    exit_time = result.exit_time
+                    while i < len(post_range_candles) and post_range_candles[i].time <= exit_time:
+                        i += 1
+                    continue
+
                 if result:
                     result.vol_threshold = vol_threshold
                     result.adx_threshold = adx_threshold
@@ -835,6 +862,11 @@ def run_simulation(
 
                     if first_breakout_only:
                         # Config-A semantics: one shot per session, no re-entry
+                        break
+
+                    if after_first_fail:
+                        # Scenario-2 semantics: one real trade after the
+                        # shadow failure, then done for the session
                         break
 
                     # If stopped out, allow re-entry
@@ -1223,6 +1255,12 @@ def parse_args() -> argparse.Namespace:
         help="Only the session's first breakout signal is eligible (no re-entry)",
     )
     parser.add_argument(
+        "--after-first-fail", action="store_true",
+        help="Skip the session's first breakout (shadow trade); only if it "
+             "stops out, take the next breakout signal as the single real "
+             "trade. Mutually exclusive with --first-breakout",
+    )
+    parser.add_argument(
         "--htf-align", action="store_true",
         help="Require breakout close on the trend side of EMA100",
     )
@@ -1288,6 +1326,10 @@ def main() -> None:
         args.cost = args.cost or "default"
         args.equity_report = True
 
+    if args.first_breakout and args.after_first_fail:
+        print("ERROR: --first-breakout and --after-first-fail are mutually exclusive")
+        sys.exit(1)
+
     # Parse instruments and sessions
     instruments = [s.strip() for s in args.instruments.split(",")]
     session_names = []
@@ -1321,7 +1363,7 @@ def main() -> None:
     print(f"  RR Target:   {args.rr_target}")
     print(f"  Stop mode:   {args.stop_mode}"
           + (f" ({args.atr_stop_mult}xATR)" if args.stop_mode == "atr" else ""))
-    print(f"  First-only:  {args.first_breakout}   HTF-align: {args.htf_align}")
+    print(f"  First-only:  {args.first_breakout}   After-fail: {args.after_first_fail}   HTF-align: {args.htf_align}")
     print(f"  Costs:       {cost_spec or 'off (gross RR)'}")
     print(f"  Vol filters: {['Off' if v is None else v for v in vol_thresholds]}")
     print(f"  ADX filters: {['Off' if a is None else a for a in adx_thresholds]}")
@@ -1403,6 +1445,7 @@ def main() -> None:
                 stop_mode=args.stop_mode,
                 atr_stop_mult=args.atr_stop_mult,
                 first_breakout_only=args.first_breakout,
+                after_first_fail=args.after_first_fail,
                 htf_align=args.htf_align,
                 atr_series=instrument_atr.get(inst),
                 ema_htf_series=instrument_ema100.get(inst),
