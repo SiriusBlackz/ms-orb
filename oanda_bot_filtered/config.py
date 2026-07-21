@@ -64,6 +64,16 @@ SESSIONS = {
 }
 
 
+# Sessions the live bot actually trades. London disabled 2026-07-21 (negative
+# across the 12mo backtest in both gross and net; see CLAUDE.md research notes).
+# Revert by setting ENABLED_SESSIONS=TOKYO,LONDON,NY in the environment.
+ENABLED_SESSIONS: frozenset[SessionName] = frozenset(
+    SessionName(s.strip().upper())
+    for s in os.getenv("ENABLED_SESSIONS", "TOKYO,NY").split(",")
+    if s.strip()
+)
+
+
 # Instruments to trade
 INSTRUMENTS = [
     "XAU_USD",      # Gold
@@ -92,7 +102,10 @@ class TradingConfig:
     # Risk management
     RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% of account
     RR_TARGET: float = float(os.getenv("RR_TARGET", "5.0"))  # Risk-reward ratio
-    MAX_TRADES_PER_SESSION: int = int(os.getenv("MAX_TRADES_PER_SESSION", "2"))
+    # Default 1 since 2026-07-21: the second entry (re-entry after a stop-out)
+    # was gross-flat but cost -86R/yr net of spread in the 12mo backtest.
+    # Re-entry machinery is intact — revert with MAX_TRADES_PER_SESSION=2.
+    MAX_TRADES_PER_SESSION: int = int(os.getenv("MAX_TRADES_PER_SESSION", "1"))
 
     # Filters (from backtest optimization)
     MIN_RANGE_SIZE_PCT: float = float(os.getenv("MIN_RANGE_SIZE_PCT", "0.1"))

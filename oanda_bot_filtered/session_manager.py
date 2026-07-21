@@ -8,6 +8,7 @@ from typing import Optional, Callable
 import pytz
 
 from config import (
+    ENABLED_SESSIONS,
     SessionConfig,
     SessionName,
     SESSIONS,
@@ -141,6 +142,8 @@ class SessionManager:
         current_time = now.time()
 
         for session_name, config in SESSIONS.items():
+            if session_name not in ENABLED_SESSIONS:
+                continue
             if self._is_time_in_session(current_time, config):
                 return session_name
 

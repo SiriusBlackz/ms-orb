@@ -8,6 +8,7 @@ from typing import Optional, Callable
 import pytz
 
 from config import (
+    ENABLED_SESSIONS,
     SessionConfig,
     SessionName,
     SESSIONS,
@@ -139,6 +140,8 @@ class SessionManager:
         current_time = now.time()
 
         for session_name, config in SESSIONS.items():
+            if session_name not in ENABLED_SESSIONS:
+                continue
             if self._is_time_in_session(current_time, config):
                 return session_name
 
@@ -594,7 +597,9 @@ class SessionManager:
         """Determine which session contains the given NY-local datetime.
 
         Uses each session's [range_start, session_close] window (handling
-        midnight crossing for Tokyo).
+        midnight crossing for Tokyo). Deliberately NOT filtered by
+        ENABLED_SESSIONS: position adoption must still attribute a leftover
+        trade opened in a since-disabled session so its exit is managed.
 
         Args:
             ny_dt: NY-timezone datetime to match against session windows.

@@ -10,6 +10,8 @@ Covers the canonical MS-ORB rules (must match backtest.py):
   2. The six in-window Tokyo candles 18:00..18:25 ARE the opening range.
   3. A target exit closes the session and arms no re-entry.
   4. A stop exit (under the trade cap) returns to WATCHING_FOR_BREAKOUT.
+  5. At the default cap (1 since 2026-07-21) a stop exit closes the session.
+  6. Disabled sessions (London) are never active.
 """
 
 import os
@@ -45,7 +47,7 @@ _stub.Position = type("Position", (), {})
 sys.modules["oanda_client"] = _stub
 
 # Now safe to import the modules under test (they resolve Candle from the stub).
-from config import SessionName  # noqa: E402
+from config import ENABLED_SESSIONS, SessionName, TradingConfig  # noqa: E402
 from strategy import Direction, OpeningRange, BreakoutDetector  # noqa: E402
 from session_manager import (  # noqa: E402
     SessionManager,
@@ -202,18 +204,71 @@ class TestReentryRules(unittest.TestCase):
         self.assertTrue(detector._breakout_up_triggered)
 
     def test_stop_exit_reenters_under_cap(self):
-        """A stop exit (under cap) -> WATCHING_FOR_BREAKOUT, direction reset."""
+        """With cap=2 a stop exit -> WATCHING_FOR_BREAKOUT, direction reset.
+
+        The default cap is 1 (re-entry disabled 2026-07-21), but the re-entry
+        machinery must keep working so MAX_TRADES_PER_SESSION=2 can revert it.
+        """
+        saved_cap = TradingConfig.MAX_TRADES_PER_SESSION
+        TradingConfig.MAX_TRADES_PER_SESSION = 2
+        try:
+            mgr, clock = build_manager()
+            clock.now = ny(18, 50)
+            ctx, detector = armed_in_trade_context(mgr, Direction.LONG)
+
+            mgr.handle_trade_exit(SessionName.TOKYO, "stop", EXPECTED_LOW)
+
+            self.assertEqual(ctx.state, SessionState.WATCHING_FOR_BREAKOUT)
+            self.assertEqual(ctx.trade_count, 1)
+            self.assertFalse(
+                detector._breakout_up_triggered,
+                "direction not reset after a stop-out (re-entry would be impossible)",
+            )
+        finally:
+            TradingConfig.MAX_TRADES_PER_SESSION = saved_cap
+
+    def test_stop_exit_at_default_cap_closes_session(self):
+        """At the default cap of 1, a stop exit -> SESSION_CLOSED (no 2nd entry)."""
+        self.assertEqual(TradingConfig.MAX_TRADES_PER_SESSION, 1)
+
         mgr, clock = build_manager()
         clock.now = ny(18, 50)
-        ctx, detector = armed_in_trade_context(mgr, Direction.LONG)
+        ctx, _ = armed_in_trade_context(mgr, Direction.LONG)
 
         mgr.handle_trade_exit(SessionName.TOKYO, "stop", EXPECTED_LOW)
 
-        self.assertEqual(ctx.state, SessionState.WATCHING_FOR_BREAKOUT)
+        self.assertEqual(ctx.state, SessionState.SESSION_CLOSED)
         self.assertEqual(ctx.trade_count, 1)
-        self.assertFalse(
-            detector._breakout_up_triggered,
-            "direction not reset after a stop-out (re-entry would be impossible)",
+
+
+class TestEnabledSessions(unittest.TestCase):
+
+    def test_london_disabled_by_default(self):
+        """London is not in ENABLED_SESSIONS and never becomes active."""
+        self.assertEqual(ENABLED_SESSIONS, {SessionName.TOKYO, SessionName.NY})
+
+        mgr, clock = build_manager()
+        clock.now = ny(4, 0)  # mid-London range window
+        self.assertIsNone(mgr.get_active_session())
+
+        # A London-range candle must not start range recording
+        mgr.process_candle(make_candle(3, 55, high=200.0, low=100.0))
+        ctx = mgr.contexts[SessionName.LONDON]
+        self.assertEqual(ctx.state, SessionState.SESSION_CLOSED)
+
+    def test_tokyo_and_ny_still_active(self):
+        """Tokyo and NY windows still resolve as active sessions."""
+        mgr, clock = build_manager()
+        clock.now = ny(18, 40)
+        self.assertEqual(mgr.get_active_session(), SessionName.TOKYO)
+        clock.now = ny(10, 30)
+        self.assertEqual(mgr.get_active_session(), SessionName.NY)
+
+    def test_adoption_can_still_attribute_london(self):
+        """infer_session_from_time stays unfiltered for position adoption."""
+        mgr, _ = build_manager()
+        self.assertEqual(
+            mgr.infer_session_from_time(ny(4, 0)), SessionName.LONDON,
         )
 
 

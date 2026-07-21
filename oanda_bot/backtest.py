@@ -86,6 +86,8 @@ class TradeResult:
     breakout_adx: Optional[float] = None
     rr_gross: float = 0.0  # RR before costs
     cost_r: float = 0.0    # round-trip cost in R units (at 1x cost multiplier)
+    is_reentry: bool = False               # trade #2+ of the session (after a stop-out)
+    breakout_bullish: Optional[bool] = None  # breakout candle body: True=green, False=red, None=doji
 
 
 @dataclass
@@ -674,6 +676,7 @@ def run_simulation(
     atr_series: Optional[dict[datetime, float]] = None,
     ema_htf_series: Optional[dict[datetime, float]] = None,
     cost_price: float = 0.0,
+    reentry_candle_color: bool = False,
 ) -> SimulationMetrics:
     """Run the full backtest simulation for one filter combination.
 
@@ -703,6 +706,12 @@ def run_simulation(
       as not aligned (matches research).
     - cost_price: round-trip cost in price units, converted to R per
       trade and subtracted from rr_achieved (rr_gross keeps the raw RR).
+    - reentry_candle_color: re-entries (trade #2+, after a stop-out) only
+      trigger on an opposite-colored breakout candle body — SHORT requires
+      a green close (close > open), LONG requires a red close (close <
+      open). A doji or wrong-color re-break is skipped and the detector is
+      re-armed, so a later qualifying break can still trade. First entries
+      are unaffected.
 
     Returns SimulationMetrics with all trade results.
     """
@@ -799,6 +808,19 @@ def run_simulation(
                         i += 1
                         continue
 
+                # Re-entry candle-color filter: trade #2+ only on an
+                # opposite-colored breakout body (SHORT needs green, LONG
+                # needs red; doji never qualifies)
+                if reentry_candle_color and trades_taken >= 1:
+                    ok = (
+                        (signal.direction == Direction.SHORT and candle.close > candle.open)
+                        or (signal.direction == Direction.LONG and candle.close < candle.open)
+                    )
+                    if not ok:
+                        detector.reset_direction(signal.direction)
+                        i += 1
+                        continue
+
                 # ATR stop mode: rebuild SL/TP off a volatility stop instead of
                 # the breakout candle's extreme
                 if stop_mode == "atr":
@@ -850,6 +872,9 @@ def run_simulation(
                     result.adx_threshold = adx_threshold
                     result.breakout_volume_ratio = vol_ratio
                     result.breakout_adx = adx_value
+                    result.is_reentry = trades_taken >= 1
+                    if candle.close != candle.open:
+                        result.breakout_bullish = candle.close > candle.open
                     result.rr_gross = result.rr_achieved
                     if cost_price > 0 and signal.risk_per_unit > 0:
                         result.cost_r = cost_price / signal.risk_per_unit
@@ -1069,6 +1094,76 @@ def print_detail_breakdown(
     print("─" * 90)
 
 
+def print_reentry_color_report(metrics: SimulationMetrics) -> None:
+    """Print re-entry performance split by breakout-candle body color.
+
+    Diagnostic for the re-entry candle-color hypothesis: a SHORT re-entry
+    off a red-bodied breakout candle (or a LONG off a green one) fails more
+    often than the opposite-colored break. First-entry rows are shown for
+    reference. Trades here are the ones the sim actually took — with the
+    filter live, a dropped re-break can be replaced by a later qualifying
+    break, so run --reentry-color for the true before/after comparison.
+    """
+    vol_label = "Off" if metrics.vol_threshold is None else f"{metrics.vol_threshold:.2f}"
+    adx_label = "Off" if metrics.adx_threshold is None else f"{metrics.adx_threshold:.0f}"
+    print(f"\n{'=' * 90}")
+    print(f"  RE-ENTRY CANDLE-COLOR DIAGNOSTIC  (Vol={vol_label}  ADX={adx_label})")
+    print(f"{'=' * 90}")
+
+    header = (
+        f"{'Entry':>9s} │ {'Dir':>5s} │ {'Candle':>6s} │ {'Trades':>6s} │ {'Wins':>5s} │ "
+        f"{'Win%':>6s} │ {'Avg RR':>7s} │ {'Total R':>8s}"
+    )
+    print(header)
+    print("─" * 90)
+
+    def _rows(trades: list[TradeResult], entry_label: str) -> None:
+        for direction in (Direction.LONG, Direction.SHORT):
+            for color_label, color_val in (("green", True), ("red", False), ("doji", None)):
+                subset = [
+                    t for t in trades
+                    if t.direction == direction and t.breakout_bullish is color_val
+                ]
+                if not subset and color_val is None:
+                    continue
+                n = len(subset)
+                wins = sum(1 for t in subset if t.rr_achieved > 0)
+                wr = wins / n if n else 0.0
+                total_r = sum(t.rr_achieved for t in subset)
+                avg_rr = total_r / n if n else 0.0
+                print(
+                    f"{entry_label:>9s} │ {direction.value:>5s} │ {color_label:>6s} │ "
+                    f"{n:>6d} │ {wins:>5d} │ {wr:>5.1%} │ {avg_rr:>+7.2f} │ {total_r:>+8.2f}"
+                )
+
+    firsts = [t for t in metrics.trades if not t.is_reentry]
+    reentries = [t for t in metrics.trades if t.is_reentry]
+    _rows(firsts, "first")
+    print("─" * 90)
+    _rows(reentries, "re-entry")
+    print("─" * 90)
+
+    # What the proposed filter keeps vs drops among the re-entries taken
+    def _qualifies(t: TradeResult) -> bool:
+        return (
+            (t.direction == Direction.SHORT and t.breakout_bullish is True)
+            or (t.direction == Direction.LONG and t.breakout_bullish is False)
+        )
+
+    kept = [t for t in reentries if _qualifies(t)]
+    dropped = [t for t in reentries if not _qualifies(t)]
+    for label, subset in (("kept", kept), ("dropped", dropped)):
+        n = len(subset)
+        wins = sum(1 for t in subset if t.rr_achieved > 0)
+        wr = wins / n if n else 0.0
+        total_r = sum(t.rr_achieved for t in subset)
+        print(
+            f"  Filter would have {label:>7s}: {n:>4d} re-entries │ "
+            f"Win% {wr:>5.1%} │ Total R {total_r:>+8.2f}"
+        )
+    print("─" * 90)
+
+
 def print_best_config(
     best_vol: Optional[float],
     best_adx: Optional[float],
@@ -1265,6 +1360,17 @@ def parse_args() -> argparse.Namespace:
         help="Require breakout close on the trend side of EMA100",
     )
     parser.add_argument(
+        "--reentry-color", action="store_true",
+        help="Re-entries (trade #2+) only on an opposite-colored breakout "
+             "candle body: SHORT needs a green close, LONG needs a red close. "
+             "Wrong color/doji is skipped; a later qualifying break can still trade",
+    )
+    parser.add_argument(
+        "--reentry-report", action="store_true",
+        help="Print the re-entry candle-color diagnostic (first vs re-entry "
+             "performance split by breakout candle body color)",
+    )
+    parser.add_argument(
         "--cost", type=str, default=None,
         help="Round-trip cost in price units: 'default' (XAU 0.35, NAS100 1.5) "
              "or 'XAU_USD=0.35,NAS100_USD=1.5'",
@@ -1364,6 +1470,7 @@ def main() -> None:
     print(f"  Stop mode:   {args.stop_mode}"
           + (f" ({args.atr_stop_mult}xATR)" if args.stop_mode == "atr" else ""))
     print(f"  First-only:  {args.first_breakout}   After-fail: {args.after_first_fail}   HTF-align: {args.htf_align}")
+    print(f"  Re-entry color filter: {args.reentry_color}")
     print(f"  Costs:       {cost_spec or 'off (gross RR)'}")
     print(f"  Vol filters: {['Off' if v is None else v for v in vol_thresholds]}")
     print(f"  ADX filters: {['Off' if a is None else a for a in adx_thresholds]}")
@@ -1450,6 +1557,7 @@ def main() -> None:
                 atr_series=instrument_atr.get(inst),
                 ema_htf_series=instrument_ema100.get(inst),
                 cost_price=cost_spec.get(inst, 0.0),
+                reentry_candle_color=args.reentry_color,
             )
             combined_metrics.trades.extend(m.trades)
 
@@ -1472,6 +1580,16 @@ def main() -> None:
     )
     if best_metrics:
         print_detail_breakdown(best_metrics, instruments, session_names)
+
+    if args.reentry_report:
+        # Diagnostic on the unfiltered (Vol=Off/ADX=Off) cell when present,
+        # else the best config
+        diag_metrics = next(
+            (m for m in all_metrics if m.vol_threshold is None and m.adx_threshold is None),
+            best_metrics,
+        )
+        if diag_metrics:
+            print_reentry_color_report(diag_metrics)
 
     print_best_config(best_vol, best_adx, all_metrics)
 
