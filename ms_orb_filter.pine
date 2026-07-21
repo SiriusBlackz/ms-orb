@@ -1,0 +1,36 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © MS-ORB Trade Filter
+
+//@version=6
+indicator(title="MS-ORB Trade Filter", shorttitle="MS-ORB", overlay=false)
+
+// Inputs
+volLen    = input.int(defval=20, title="Volume SMA Length", minval=1)
+volThresh = input.float(defval=1.5, title="Volume Ratio Threshold", minval=0.1, step=0.1)
+adxLen    = input.int(defval=14, title="ADX Period", minval=1)
+adxThresh = input.float(defval=35.0, title="ADX Threshold", minval=1.0, step=1.0)
+
+// Volume Ratio
+avgVol   = ta.sma(volume, volLen)
+volRatio = avgVol > 0 ? volume / avgVol : 0.0
+volPass  = volRatio >= volThresh
+
+// ADX
+dmiPlus  = ta.dmi(adxLen, adxLen)
+adxVal   = array.get(dmiPlus, 2)
+adxPass  = adxVal >= adxThresh
+
+// Both filters pass
+bothPass = volPass and adxPass
+
+// Plot Volume Ratio
+bgcolor(volPass ? color.new(color.green, 85) : na, title="Vol Pass BG")
+plot(volRatio, title="Vol Ratio", color=volPass ? color.green : color.gray, linewidth=2)
+hline(volThresh, title="Vol Threshold", color=color.red, linestyle=hline.style_dashed)
+
+// Signal markers
+plotshape(bothPass, title="BOTH PASS", style=shape.triangleup, location=location.bottom, color=color.lime, size=size.small, text="GO")
+plotshape(not volPass and not adxPass, title="NEITHER", style=shape.xcross, location=location.bottom, color=color.new(color.red, 60), size=size.tiny)
+
+// Alert
+alertcondition(bothPass, title="MS-ORB Filter Pass", message="Vol & ADX filters passed - check for breakout")
