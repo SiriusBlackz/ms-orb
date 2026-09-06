@@ -5,7 +5,7 @@ strategy across OANDA (FX/commodities/indices) and IBKR (US equities).
 
 ## Repo layout
 
-- `oanda_bot/` — OANDA bot, multi-instrument (`XAU_USD`, `NAS100_USD`), all three sessions (Tokyo, London, NY). **Deployed** as `ms-orb-oanda`.
+- `oanda_bot/` — OANDA bot, multi-instrument (`XAU_USD`, `NAS100_USD`), Tokyo + NY sessions (London disabled 2026-07-21). **Deployed** as `ms-orb-oanda`.
 - `oanda_bot_filtered/` — variant with extra filters. **Deployed** as `ms-orb-filtered` (at `/opt/ms-orb-oanda-filtered/`).
 - `oanda_bot_orderflow/` — **CVD+ramp order flow variant**. Filters breakouts by range-period CVD alignment + pre-breakout volume ramp. **Not deployed** (local + git only).
 - `ibkr_bot/` — IBKR bot, TSLA only, NY session only. **Deployed** as `ms-orb-ibkr`.
@@ -69,8 +69,9 @@ within `session_close`, so the session can still trade that day.
 - **Stop loss**: `candle.low` (LONG) / `candle.high` (SHORT) — **breakout-candle-based, not range-based**. Because the breakout candle's wick usually dips back into the range before closing out of it, **SL typically lands inside the range box**. This is by design and matches `backtest.py`.
 - **Take profit**: `entry ± risk × RR_TARGET` (default `RR_TARGET=5.0`)
 - **Risk**: 1% of account balance per trade (`RISK_PER_TRADE=0.01`)
-- **Max trades per session**: 2 (`MAX_TRADES_PER_SESSION=2`)
-- **Re-entry allowed ONLY after a stop-out** (then same-direction re-break, or opposite-direction break), and only while under the trade cap. A **target or time exit closes the session** for that instrument — no re-entry. `handle_trade_exit()`/`_close_trade()` gate both the state transition and `reset_direction()` on `reason == "stop"` (matches `backtest.py:726-737`). Verified by `oanda_bot/test_session_manager.py`.
+- **Max trades per session**: 1 (`MAX_TRADES_PER_SESSION=1`, default since 2026-07-21 — the second entry was gross-flat but cost ~−86R/yr net of spread over 12mo; first-only = −45R vs −131R net, Tokyo+NY-only first-only = **+50.7R net, PF 1.06**)
+- **Re-entry (disabled by default via the cap of 1, machinery retained)**: allowed ONLY after a stop-out (then same-direction re-break, or opposite-direction break), and only while under the trade cap. A **target or time exit closes the session** for that instrument — no re-entry. `handle_trade_exit()`/`_close_trade()` gate both the state transition and `reset_direction()` on `reason == "stop"` (matches `backtest.py`). Verified by `oanda_bot/test_session_manager.py`. Revert to two entries with env `MAX_TRADES_PER_SESSION=2`.
+- **Sessions traded**: Tokyo + NY only. **London disabled 2026-07-21** (negative gross AND net over 12mo: −95R net even first-entry-only, driven by XAU London). Controlled by `ENABLED_SESSIONS` (config.py, env-overridable, default `TOKYO,NY`); filters `get_active_session()` only — `infer_session_from_time()` stays unfiltered so position adoption can still attribute a leftover London trade. Revert with env `ENABLED_SESSIONS=TOKYO,LONDON,NY`. `backtest.py` is unaffected (session choice via `--sessions`), but it DOES inherit the cap default — plain runs are now single-entry; use env `MAX_TRADES_PER_SESSION=2` to backtest the old two-entry rule.
 - **Time-based auto-close**: 5 minutes before session end
 
 ### Session windows (NY-local, `config.py:41-64`)
@@ -78,7 +79,7 @@ within `session_close`, so the session can still trade that day.
 | Session | Range | Entry window | Session close |
 |---|---|---|---|
 | Tokyo | 18:00–18:30 | 18:30–21:30 | 02:54 (next day) |
-| London | 03:00–03:30 | 03:30–06:30 | 08:25 |
+| London (**not traded** since 2026-07-21) | 03:00–03:30 | 03:30–06:30 | 08:25 |
 | NY | 09:30–10:00 | 10:00–13:00 | 15:55 |
 
 ## OANDA vs IBKR differences
@@ -120,9 +121,9 @@ ssh root@146.190.76.14 'journalctl -u ms-orb-oanda -f'   # tail logs
 > `/opt/ms-orb-oanda-filtered`, service `ms-orb-filtered`, and log
 > `/var/log/ms-orb-filtered.log`.
 
-> Claude can't SSH to the droplet non-interactively (its key isn't in root's
+> Agents can't SSH to the droplet non-interactively (no agent key in root's
 > `authorized_keys`); the droplet accepts password auth, so the user runs droplet
-> commands via the `!` prefix.
+> commands themselves. Never attempt `ssh root@146.190.76.14` or `rsync` to it.
 
 ## Debugging tips
 
