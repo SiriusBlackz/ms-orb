@@ -640,14 +640,13 @@ class OANDAClient:
             List of trade dictionaries.
         """
         try:
-            params = {}
-            if instrument:
-                params["instrument"] = instrument
-
-            r = trades.OpenTrades(self.account_id, params=params if params else None)
+            r = trades.OpenTrades(self.account_id)
             self.api.request(r)
 
-            return r.response.get("trades", [])
+            all_trades = r.response.get("trades", [])
+            if instrument:
+                return [t for t in all_trades if t.get("instrument") == instrument]
+            return all_trades
         except Exception as e:
             logger.error(f"Failed to get open trades: {e}")
             return []
