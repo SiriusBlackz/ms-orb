@@ -60,6 +60,17 @@ class OrderResult:
     error: Optional[str] = None
 
 
+@dataclass
+class ExitFill:
+    """How a position was closed, taken from actual order fills."""
+    price: float
+    reason: Optional[str]  # 'target', 'stop', or None when it must be inferred
+
+
+# Order states that mean the order is dead and will never fill.
+DEAD_ORDER_STATES = ("Cancelled", "ApiCancelled", "Inactive")
+
+
 class IBKRClient:
     """Client for Interactive Brokers via ib_insync."""
 
@@ -85,6 +96,13 @@ class IBKRClient:
         # Cache the TSLA contract
         self._contracts: dict[str, Contract] = {}
 
+        # Live bracket per instrument: parent/take-profit/stop Trade objects
+        # plus entry action and time, used to read the real exit fill.
+        self._brackets: dict[str, dict] = {}
+
+        # Last IB error text per order id, so a failed entry can say why.
+        self._order_errors: dict[int, str] = {}
+
         # Register event handlers for disconnect/error detection
         self.ib.disconnectedEvent += self._on_disconnect
         self.ib.errorEvent += self._on_error
@@ -107,10 +125,24 @@ class IBKRClient:
                 f"Connected to IBKR | Host: {self.host}:{self.port} | "
                 f"Client ID: {self.client_id}"
             )
+            self._use_delayed_data_fallback()
             return True
         except Exception as e:
             logger.error(f"IBKR connection failed: {e}")
             return False
+
+    def _use_delayed_data_fallback(self) -> None:
+        """Ask IB for delayed quotes when live ones are not subscribed.
+
+        Market data type 3 = live if available, otherwise 15-min delayed.
+        Without it, quote requests on an account with no API market-data
+        subscription fail with error 10089. Quotes are only a last-resort
+        fallback here: entries and exits are read from order fills.
+        """
+        try:
+            self.ib.reqMarketDataType(3)
+        except Exception as e:
+            logger.warning(f"Could not set delayed market data type: {e}")
 
     def _on_disconnect(self):
         """Handle disconnect event from ib_insync."""
@@ -119,6 +151,10 @@ class IBKRClient:
 
     def _on_error(self, reqId, errorCode, errorString, contract):
         """Handle IB error events for connectivity issues."""
+        if reqId is not None and reqId > 0:
+            self._order_errors[reqId] = f"IB error {errorCode}: {errorString}"
+            if len(self._order_errors) > 200:
+                self._order_errors.pop(next(iter(self._order_errors)))
         if errorCode == 1100:
             logger.warning(f"IB connectivity lost: {errorString}")
         elif errorCode == 1102:
@@ -157,6 +193,7 @@ class IBKRClient:
                 self._connected = True
                 self._contracts = {}  # Force re-qualification after reconnect
                 logger.info(f"Reconnected to IBKR on attempt {attempt}")
+                self._use_delayed_data_fallback()
                 return True
             except Exception as e:
                 logger.error(f"Reconnect attempt {attempt} failed: {e}")
@@ -387,6 +424,27 @@ class IBKRClient:
             logger.error(f"Failed to get position for {instrument}: {e}")
             return None
 
+    def get_position_units(self, instrument: str) -> Optional[int]:
+        """Signed share count for an instrument, or None when it is UNKNOWN.
+
+        Unlike get_position(), this never reports "flat" when the answer is
+        simply unavailable (disconnected, or the request failed). Callers
+        must not treat None as a closed position.
+
+        Returns:
+            Signed units (0 = confirmed flat), or None if unknown.
+        """
+        if not self.ib.isConnected():
+            return None
+        try:
+            for pos in self.ib.positions():
+                if pos.contract.symbol == instrument:
+                    return int(pos.position)
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to get position for {instrument}: {e}")
+            return None
+
     def get_all_positions(self) -> list[Position]:
         """Get all open positions.
 
@@ -442,6 +500,35 @@ class IBKRClient:
 
         return max(shares, min_units) if shares > 0 else 0
 
+    def _wait_for_fill(self, trade: Trade, timeout: float) -> str:
+        """Wait until an order fills, dies, or the timeout passes.
+
+        Returns:
+            The final order status string.
+        """
+        waited = 0.0
+        step = 0.5
+        while waited < timeout:
+            status = trade.orderStatus.status
+            if status == "Filled" or status in DEAD_ORDER_STATES:
+                return status
+            self.ib.sleep(step)
+            waited += step
+        return trade.orderStatus.status
+
+    def _cancel_trades(self, trades: list) -> None:
+        """Cancel orders that are still working; ignore ones already done."""
+        for trade in trades:
+            if trade is None:
+                continue
+            status = trade.orderStatus.status
+            if status == "Filled" or status in DEAD_ORDER_STATES:
+                continue
+            try:
+                self.ib.cancelOrder(trade.order)
+            except Exception as e:
+                logger.error(f"Failed to cancel order {trade.order.orderId}: {e}")
+
     def place_market_order(
         self,
         instrument: str,
@@ -453,6 +540,10 @@ class IBKRClient:
 
         Uses IB bracket order: parent market + SL stop + TP limit.
 
+        The entry counts as successful ONLY once the parent is Filled. If it
+        has not filled within ENTRY_FILL_TIMEOUT seconds the whole bracket is
+        cancelled, so a "failed" order can never go on to fill untracked.
+
         Args:
             instrument: Instrument symbol.
             units: Number of shares (positive=buy, negative=sell).
@@ -462,6 +553,7 @@ class IBKRClient:
         Returns:
             OrderResult with order details or error.
         """
+        parent_trade = tp_trade = sl_trade = None
         try:
             contract = self._get_contract(instrument)
             action = "BUY" if units > 0 else "SELL"
@@ -492,17 +584,33 @@ class IBKRClient:
 
             # Place all three orders
             parent_trade = self.ib.placeOrder(contract, parent)
-            self.ib.placeOrder(contract, tp_order)
-            self.ib.placeOrder(contract, sl_order)
+            tp_trade = self.ib.placeOrder(contract, tp_order)
+            sl_trade = self.ib.placeOrder(contract, sl_order)
 
-            # Wait for fill (up to 10 seconds)
-            self.ib.sleep(2)
+            timeout = TradingConfig.ENTRY_FILL_TIMEOUT
+            status = self._wait_for_fill(parent_trade, timeout)
 
-            # Check fill status
-            if parent_trade.orderStatus.status in ('Filled', 'PreSubmitted', 'Submitted'):
+            if status != "Filled":
+                # Not filled in time: pull the whole bracket, then look again
+                # in case the fill and the cancel crossed.
+                logger.error(
+                    f"Entry for {instrument} not filled after {timeout}s "
+                    f"(status {status}); cancelling bracket"
+                )
+                self._cancel_trades([parent_trade, tp_trade, sl_trade])
+                self.ib.sleep(2)
+                status = parent_trade.orderStatus.status
+
+            if status == "Filled":
                 fill_price = parent_trade.orderStatus.avgFillPrice or 0
                 order_id = parent_trade.order.orderId
-
+                self._brackets[instrument] = {
+                    "parent": parent_trade,
+                    "tp": tp_trade,
+                    "sl": sl_trade,
+                    "action": action,
+                    "since": datetime.now().astimezone(),
+                }
                 return OrderResult(
                     success=True,
                     order_id=order_id,
@@ -510,19 +618,91 @@ class IBKRClient:
                     fill_price=fill_price if fill_price > 0 else None,
                     units=units,
                 )
-            else:
-                status = parent_trade.orderStatus.status
-                return OrderResult(
-                    success=False,
-                    error=f"Order status: {status}",
+
+            # Cancelled without a full fill. A partial fill would now be an
+            # unprotected position (its children were cancelled) - flatten it.
+            filled = getattr(parent_trade.orderStatus, "filled", 0) or 0
+            if filled > 0:
+                logger.critical(
+                    f"Entry for {instrument} partially filled ({filled} shares) "
+                    f"before cancel; flattening"
                 )
+                self.close_position(instrument)
+            why = self._order_errors.get(parent_trade.order.orderId)
+            return OrderResult(
+                success=False,
+                error=(f"Entry not filled within {timeout}s (status {status}); bracket cancelled"
+                       + (f" | {why}" if why else " | no error reported by IB")),
+            )
 
         except Exception as e:
             logger.error(f"Order failed for {instrument}: {e}")
+            # Never leave a half-placed bracket working after an exception.
+            self._cancel_trades([parent_trade, tp_trade, sl_trade])
             return OrderResult(success=False, error=str(e))
+
+    def get_exit_fill(self, instrument: str, since: Optional[datetime] = None,
+                      entry_action: Optional[str] = None) -> Optional[ExitFill]:
+        """Find how the current/last position was closed, from real fills.
+
+        First checks the bracket's own child orders (take-profit / stop). If
+        those are not available (bot restarted, position adopted), falls back
+        to today's executions on the closing side since the entry.
+
+        Args:
+            instrument: Instrument symbol.
+            since: Only consider executions at/after this time (fallback path).
+            entry_action: 'BUY' or 'SELL' of the entry (fallback path).
+
+        Returns:
+            ExitFill, or None if no closing fill can be found.
+        """
+        bracket = self._brackets.get(instrument)
+        if bracket:
+            for key, reason in (("tp", "target"), ("sl", "stop")):
+                trade = bracket.get(key)
+                if trade is not None and trade.orderStatus.status == "Filled":
+                    price = trade.orderStatus.avgFillPrice
+                    if price:
+                        return ExitFill(price=float(price), reason=reason)
+            since = since or bracket.get("since")
+            entry_action = entry_action or bracket.get("action")
+
+        if not entry_action:
+            return None
+        closing_side = "SLD" if entry_action == "BUY" else "BOT"
+        try:
+            shares = 0.0
+            notional = 0.0
+            for fill in self.ib.fills():
+                if fill.contract.symbol != instrument:
+                    continue
+                if fill.execution.side != closing_side:
+                    continue
+                if since is not None and fill.time is not None:
+                    try:
+                        if fill.time < since:
+                            continue
+                    except TypeError:
+                        pass  # naive/aware mismatch: keep the fill
+                shares += fill.execution.shares
+                notional += fill.execution.shares * fill.execution.price
+            if shares > 0:
+                return ExitFill(price=notional / shares, reason=None)
+        except Exception as e:
+            logger.error(f"Failed to read executions for {instrument}: {e}")
+        return None
+
+    def clear_bracket(self, instrument: str) -> None:
+        """Forget the tracked bracket once its trade is fully closed out."""
+        self._brackets.pop(instrument, None)
 
     def close_position(self, instrument: str) -> OrderResult:
         """Close all positions for an instrument.
+
+        Cancels any working orders for the symbol, sends a closing market
+        order and waits for it to fill. Reports success only when the close
+        actually filled (or there was nothing to close).
 
         Args:
             instrument: Instrument symbol.
@@ -531,43 +711,44 @@ class IBKRClient:
             OrderResult with close details or error.
         """
         try:
-            position = self.get_position(instrument)
-            if not position:
+            units = self.get_position_units(instrument)
+            if units is None:
+                return OrderResult(success=False, error="Position unknown (not connected)")
+            if units == 0:
+                self.cancel_all_orders(instrument)
                 return OrderResult(success=True, error="No position to close")
 
             contract = self._get_contract(instrument)
 
-            # Cancel any open orders for this contract first
-            open_orders = self.ib.openOrders()
-            for order in open_orders:
-                trades = self.ib.openTrades()
-                for trade in trades:
-                    if trade.contract.symbol == instrument:
-                        self.ib.cancelOrder(trade.order)
-
+            # Cancel the bracket children (and anything else) first, so the
+            # stop/target cannot fire after the position is flat.
+            self.cancel_all_orders(instrument)
             self.ib.sleep(1)
 
             # Place closing market order
-            action = "SELL" if position.units > 0 else "BUY"
-            quantity = abs(position.units)
+            action = "SELL" if units > 0 else "BUY"
+            quantity = abs(units)
 
             order = MarketOrder(action=action, totalQuantity=quantity)
             trade = self.ib.placeOrder(contract, order)
 
-            self.ib.sleep(2)
+            status = self._wait_for_fill(trade, TradingConfig.EXIT_FILL_TIMEOUT)
 
-            if trade.orderStatus.status == 'Filled':
+            if status == "Filled":
                 fill_price = trade.orderStatus.avgFillPrice
                 return OrderResult(
                     success=True,
                     order_id=trade.order.orderId,
-                    fill_price=fill_price,
-                    units=-position.units,
+                    fill_price=float(fill_price) if fill_price else None,
+                    units=-units,
                 )
 
+            # Leave the closing order working (it is a market order and the
+            # position must go); the caller retries/re-checks next loop.
             return OrderResult(
-                success=True,
+                success=False,
                 order_id=trade.order.orderId,
+                error=f"Close order not filled after {TradingConfig.EXIT_FILL_TIMEOUT}s (status {status})",
             )
 
         except Exception as e:
@@ -596,6 +777,8 @@ class IBKRClient:
                     "quantity": trade.order.totalQuantity,
                     "type": trade.order.orderType,
                     "status": trade.orderStatus.status,
+                    "stop_price": getattr(trade.order, "auxPrice", None),
+                    "limit_price": getattr(trade.order, "lmtPrice", None),
                 })
             return result
         except Exception as e:

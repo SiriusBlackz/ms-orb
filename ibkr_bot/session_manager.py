@@ -292,9 +292,10 @@ class SessionManager:
 
         ctx.trades.append(ctx.current_trade)
 
+        exit_s = f"{exit_price:.2f}" if exit_price is not None else "unknown"
         logger.info(
             f"[NY] {self.instrument} Trade closed: "
-            f"{ctx.current_trade.direction.value} exit={exit_price:.2f} reason={reason}"
+            f"{ctx.current_trade.direction.value} exit={exit_s} reason={reason}"
         )
 
         if self.on_trade_closed:
@@ -308,10 +309,51 @@ class SessionManager:
         ctx.current_trade = None
         ctx.current_trade_id = None
 
+    def handle_order_failed(self, reason: str) -> None:
+        """The entry order for the current signal did not result in a position.
+
+        The signal moved the session to IN_TRADE before the order was sent;
+        undo that. No trade is recorded (nothing was filled) and the session
+        is closed for the day: Config A takes only the first breakout, and an
+        order failure means the broker link is not trustworthy right now.
+        """
+        ctx = self.context
+        if ctx.state == SessionState.IN_TRADE:
+            ctx.current_trade = None
+            ctx.current_trade_id = None
+            ctx.state = SessionState.SESSION_CLOSED
+            logger.warning(
+                f"[NY] {self.instrument} -> SESSION_CLOSED (entry order failed: {reason})"
+            )
+
+    def adopt_trade(
+        self,
+        direction: Direction,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        trade_id: Optional[str] = None,
+    ) -> None:
+        """Take over a position that was already open when the bot started."""
+        ctx = self.context
+        ctx.current_trade = TradeRecord(
+            direction=direction,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            entry_time=self.get_current_time_ny(),
+            trade_id=trade_id,
+        )
+        ctx.current_trade_id = trade_id
+        ctx.state = SessionState.IN_TRADE
+        logger.info(
+            f"[NY] {self.instrument} -> IN_TRADE (adopted {direction.value} @ {entry_price:.2f})"
+        )
+
     def handle_trade_exit(
         self,
         reason: str,
-        exit_price: float,
+        exit_price: Optional[float],
     ) -> None:
         """Handle external notification of trade exit (from position monitor)."""
         ctx = self.context

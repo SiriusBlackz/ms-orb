@@ -92,6 +92,18 @@ class TradingConfig:
 
     # Polling intervals
     PRICE_POLL_INTERVAL: int = int(os.getenv("PRICE_POLL_INTERVAL", "10"))  # seconds
+
+    # Order handling: how long to wait for a market order to fill before the
+    # entry bracket is cancelled / the close is reported as not done.
+    ENTRY_FILL_TIMEOUT: float = float(os.getenv("ENTRY_FILL_TIMEOUT", "30"))
+    EXIT_FILL_TIMEOUT: float = float(os.getenv("EXIT_FILL_TIMEOUT", "30"))
+
+    # Data freshness: a completed 5-min bar should be seen within seconds of
+    # its close. Without a real-time market-data subscription IB serves bars
+    # ~15 minutes late; signals from those are worthless, so candles older
+    # than this (seconds past their close, during the session) are ignored.
+    # 0 disables the check.
+    DATA_MAX_LAG_SECONDS: float = float(os.getenv("DATA_MAX_LAG_SECONDS", "180"))
     CANDLE_GRANULARITY: str = "5 mins"  # ib_insync bar size
 
     # IBKR connection configuration

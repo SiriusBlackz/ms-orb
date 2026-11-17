@@ -88,6 +88,13 @@ class TradingBot:
         self._open_position: Optional[dict] = None
         self._last_candle_time: Optional[datetime] = None
 
+        # Consecutive loops on which the broker reported us flat while we
+        # still track a position but no closing fill could be found.
+        self._flat_checks = 0
+        # Set when the account holds a position the bot cannot explain; no
+        # new entries are sent until the account is flat again.
+        self._blocked_reason: Optional[str] = None
+
         logger.info(f"IBKR Trading bot initialized for {self.instrument}")
         logger.info(f"Dry run mode: {self.dry_run}")
 
@@ -107,10 +114,20 @@ class TradingBot:
             logger.info("DRY RUN - Order not placed")
             return
 
+        # Never stack a new trade on top of a position we did not open.
+        self._refresh_block()
+        if self._blocked_reason:
+            logger.critical(
+                f"ORDER SKIPPED | {self.instrument} | {self._blocked_reason}"
+            )
+            self.session_manager.handle_order_failed(self._blocked_reason)
+            return
+
         # Get account balance for position sizing
         balance = self.client.get_account_balance()
         if balance <= 0:
             logger.error("Failed to get account balance, skipping trade")
+            self.session_manager.handle_order_failed("no account balance")
             return
 
         # Calculate position size
@@ -123,6 +140,7 @@ class TradingBot:
 
         if units <= 0:
             logger.warning("Position size is 0, skipping trade")
+            self.session_manager.handle_order_failed("position size 0")
             return
 
         # Adjust units for direction
@@ -142,6 +160,16 @@ class TradingBot:
                 f"ORDER FILLED | {self.instrument} | {result.units} shares @ {result.fill_price} "
                 f"| Order ID: {result.order_id}"
             )
+            if result.fill_price:
+                risk = abs(signal.entry_price - signal.stop_loss)
+                slip = result.fill_price - signal.entry_price
+                if signal.direction == Direction.SHORT:
+                    slip = -slip
+                logger.info(
+                    f"ENTRY SLIPPAGE | {self.instrument} | signal {signal.entry_price:.2f} "
+                    f"fill {result.fill_price:.2f} | {slip:+.2f} = "
+                    f"{(slip / risk if risk else 0):+.2f}R (positive = worse)"
+                )
 
             # Log to database
             db_id = self.trade_logger.log_entry(
@@ -166,7 +194,10 @@ class TradingBot:
                 "stop_loss": signal.stop_loss,
                 "take_profit": signal.take_profit,
                 "units": abs(result.units or units),
+                "entry_action": "BUY" if signal.direction == Direction.LONG else "SELL",
+                "since": datetime.now().astimezone(),
             }
+            self._flat_checks = 0
 
             # Update session manager
             if result.trade_id:
@@ -174,6 +205,8 @@ class TradingBot:
 
         else:
             logger.error(f"ORDER FAILED | {self.instrument} | {result.error}")
+            # The client has already cancelled the bracket; release the session.
+            self.session_manager.handle_order_failed(result.error or "order failed")
 
     def _on_trade_closed(self, record) -> None:
         """Handle trade closed notification from session manager."""
@@ -182,61 +215,92 @@ class TradingBot:
             f"Exit: {record.exit_price} Reason: {record.exit_reason}"
         )
 
-    def _check_position(self) -> None:
-        """Check and update open position from IBKR."""
-        if self._open_position is None:
+    def _refresh_block(self) -> None:
+        """Re-evaluate whether an unexplained position should block trading."""
+        if self._open_position is not None:
+            return
+        units = self.client.get_position_units(self.instrument)
+        if units is None:
+            return  # unknown: keep the current view
+        if units != 0:
+            if not self._blocked_reason:
+                logger.critical(
+                    f"UNEXPLAINED POSITION | {self.instrument} | {units} shares held but "
+                    f"not opened by this run - trading is blocked until the account is flat"
+                )
+            self._blocked_reason = f"unexplained position of {units} shares"
+        elif self._blocked_reason:
+            logger.warning(f"{self.instrument} account is flat again - trading unblocked")
+            self._blocked_reason = None
+
+    def _reconcile_on_start(self) -> None:
+        """Bring the bot's view in line with the account at startup.
+
+        - Flat with working orders: cancel them (stale bracket children could
+          otherwise open a position on their own).
+        - Position with a matching stop + target working: adopt it so the
+          time exit and exit logging still apply.
+        - Any other position: block new entries until the account is flat.
+        """
+        units = self.client.get_position_units(self.instrument)
+        if units is None:
+            logger.warning("Could not read positions at startup; will re-check")
             return
 
+        orders = self.client.get_open_orders(self.instrument)
+        if units == 0:
+            if orders:
+                logger.warning(
+                    f"Flat but {len(orders)} working {self.instrument} order(s) found - cancelling"
+                )
+                self.client.cancel_all_orders(self.instrument)
+            return
+
+        closing = "SELL" if units > 0 else "BUY"
+        stops = [o for o in orders if o["type"] in ("STP", "STP LMT")
+                 and o["action"] == closing and int(o["quantity"]) == abs(units)]
+        targets = [o for o in orders if o["type"] == "LMT"
+                   and o["action"] == closing and int(o["quantity"]) == abs(units)]
         pos = self.client.get_position(self.instrument)
 
-        if pos is None or pos.units == 0:
-            # Position was closed (by SL or TP)
-            logger.info(f"Position closed detected: {self.instrument}")
+        if len(stops) == 1 and len(targets) == 1 and pos:
+            direction = Direction.LONG if units > 0 else Direction.SHORT
+            stop_loss = float(stops[0]["stop_price"])
+            take_profit = float(targets[0]["limit_price"])
+            self._open_position = {
+                "trade_id": None,
+                "db_id": None,
+                "direction": direction,
+                "entry_price": pos.avg_price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "units": abs(units),
+                "entry_action": "BUY" if units > 0 else "SELL",
+                "since": datetime.now().astimezone(),
+            }
+            self.session_manager.adopt_trade(direction, pos.avg_price, stop_loss, take_profit)
+            logger.warning(
+                f"ADOPTED POSITION | {self.instrument} | {direction.value} {abs(units)} shares "
+                f"@ {pos.avg_price:.2f} | SL={stop_loss} TP={take_profit}"
+            )
+        else:
+            self._refresh_block()
 
-            pos_info = self._open_position
-            exit_price = None
-            exit_reason = "unknown"
-
-            # Determine exit reason from price
-            price = self.client.get_price(self.instrument)
-            if price:
-                current_price = price.mid
-
-                if pos_info["direction"] == Direction.LONG:
-                    if current_price <= pos_info["stop_loss"]:
-                        exit_reason = "stop"
-                        exit_price = pos_info["stop_loss"]
-                    elif current_price >= pos_info["take_profit"]:
-                        exit_reason = "target"
-                        exit_price = pos_info["take_profit"]
-                    else:
-                        exit_reason = "unknown"
-                        exit_price = current_price
-                else:
-                    if current_price >= pos_info["stop_loss"]:
-                        exit_reason = "stop"
-                        exit_price = pos_info["stop_loss"]
-                    elif current_price <= pos_info["take_profit"]:
-                        exit_reason = "target"
-                        exit_price = pos_info["take_profit"]
-                    else:
-                        exit_reason = "unknown"
-                        exit_price = current_price
-
-            if exit_price:
+    def _record_exit(self, exit_price: Optional[float], exit_reason: str) -> None:
+        """Write the exit to the database and tell the session manager."""
+        pos_info = self._open_position
+        pnl = rr = None
+        try:
+            if exit_price is not None:
                 pnl = calculate_pnl(
-                    pos_info["direction"].value,
-                    pos_info["entry_price"],
-                    exit_price,
-                    pos_info["units"],
+                    pos_info["direction"].value, pos_info["entry_price"],
+                    exit_price, pos_info["units"],
                 )
                 rr = calculate_rr_achieved(
-                    pos_info["direction"].value,
-                    pos_info["entry_price"],
-                    exit_price,
-                    pos_info["stop_loss"],
+                    pos_info["direction"].value, pos_info["entry_price"],
+                    exit_price, pos_info["stop_loss"],
                 )
-
+            if pos_info["db_id"] is not None:
                 self.trade_logger.log_exit(
                     row_id=pos_info["db_id"],
                     exit_price=exit_price,
@@ -244,25 +308,63 @@ class TradingBot:
                     pnl=pnl,
                     rr_achieved=rr,
                 )
-
-                logger.info(
-                    f"EXIT LOGGED | {self.instrument} | "
-                    f"Price: {exit_price:.2f} Reason: {exit_reason} "
-                    f"PnL: ${pnl:.2f} RR: {rr:.2f}"
-                )
-            else:
-                logger.warning(
-                    f"Could not determine exit price for {self.instrument}, "
-                    f"using entry price as fallback"
-                )
-                exit_price = pos_info["entry_price"]
-                exit_reason = "unknown"
-
-            # Always notify session manager so it can transition
-            # back to WATCHING_FOR_BREAKOUT for re-entry
+            price_s = f"{exit_price:.2f}" if exit_price is not None else "unknown"
+            pnl_s = f"${pnl:.2f}" if pnl is not None else "n/a"
+            rr_s = f"{rr:.2f}" if rr is not None else "n/a"
+            logger.info(
+                f"EXIT LOGGED | {self.instrument} | Price: {price_s} "
+                f"Reason: {exit_reason} PnL: {pnl_s} RR: {rr_s}"
+            )
+        except Exception as e:
+            logger.error(f"Error logging exit for {self.instrument}: {e}", exc_info=True)
+        finally:
+            # Always release the position and the session, even if logging failed.
             self.session_manager.handle_trade_exit(exit_reason, exit_price)
-
+            self.client.clear_bracket(self.instrument)
             self._open_position = None
+            self._flat_checks = 0
+
+    def _check_position(self) -> None:
+        """Detect that the open position was closed by its stop or target.
+
+        The exit price and reason come from the bracket's own fills. "Flat"
+        is only believed when the broker link is up; if we are flat but no
+        closing fill can be found, wait a few loops before giving up and
+        recording the exit as unknown.
+        """
+        if self._open_position is None:
+            return
+
+        units = self.client.get_position_units(self.instrument)
+        if units is None or units != 0:
+            self._flat_checks = 0
+            return  # still open, or state unknown (disconnected)
+
+        pos_info = self._open_position
+        fill = self.client.get_exit_fill(
+            self.instrument,
+            since=pos_info.get("since"),
+            entry_action=pos_info.get("entry_action"),
+        )
+
+        if fill is None:
+            self._flat_checks += 1
+            if self._flat_checks < 3:
+                return
+            logger.warning(
+                f"Position closed detected: {self.instrument}, but no closing fill found"
+            )
+            self._record_exit(None, "unknown")
+            return
+
+        logger.info(f"Position closed detected: {self.instrument}")
+        reason = fill.reason
+        if reason is None:
+            # Infer from which bracket level the fill is nearer to.
+            sl_dist = abs(fill.price - pos_info["stop_loss"])
+            tp_dist = abs(fill.price - pos_info["take_profit"])
+            reason = "stop" if sl_dist < tp_dist else "target"
+        self._record_exit(fill.price, reason)
 
     def _check_time_exit(self) -> None:
         """Check if position needs to be closed due to session time exit."""
@@ -282,39 +384,21 @@ class TradingBot:
             if not self.dry_run:
                 result = self.client.close_position(self.instrument)
                 if result.success:
-                    exit_price = result.fill_price or 0
-                    pos_info = self._open_position
-
-                    pnl = calculate_pnl(
-                        pos_info["direction"].value,
-                        pos_info["entry_price"],
-                        exit_price,
-                        pos_info["units"],
-                    )
-                    rr = calculate_rr_achieved(
-                        pos_info["direction"].value,
-                        pos_info["entry_price"],
-                        exit_price,
-                        pos_info["stop_loss"],
-                    )
-
-                    self.trade_logger.log_exit(
-                        row_id=pos_info["db_id"],
-                        exit_price=exit_price,
-                        exit_reason="time",
-                        pnl=pnl,
-                        rr_achieved=rr,
-                    )
-
                     logger.info(
-                        f"TIME EXIT COMPLETE | {self.instrument} | "
-                        f"Exit: {exit_price:.2f} PnL: ${pnl:.2f}"
+                        f"TIME EXIT COMPLETE | {self.instrument} | Exit: {result.fill_price}"
                     )
-
-                    self.session_manager.handle_trade_exit("time", exit_price)
-                    self._open_position = None
+                    self._record_exit(result.fill_price, "time")
                 else:
+                    # Retried on the next loop while the position is still tracked.
                     logger.error(f"Failed to close position: {result.error}")
+
+    def _candle_lag_seconds(self, candle: Candle) -> Optional[float]:
+        """Seconds between the bar's close and now (same clock the session uses)."""
+        try:
+            bar_end = candle.time.astimezone(NY_TZ) + timedelta(minutes=5)
+            return (self._get_current_time_ny() - bar_end).total_seconds()
+        except Exception:
+            return None
 
     def _process_candles(self) -> None:
         """Fetch and process latest candles for TSLA."""
@@ -332,6 +416,19 @@ class TradingBot:
                 return
 
             self._last_candle_time = candle.time
+
+            # How late is this bar? (seconds since its close)
+            lag = self._candle_lag_seconds(candle)
+            if lag is not None and self.session_manager.is_session_active():
+                logger.info(f"CANDLE LAG | {self.instrument} | bar closed {lag:.0f}s ago")
+                max_lag = TradingConfig.DATA_MAX_LAG_SECONDS
+                if max_lag and lag > max_lag:
+                    logger.critical(
+                        f"DELAYED DATA | {self.instrument} | latest bar is {lag / 60:.1f} min old "
+                        f"(limit {max_lag:.0f}s) - ignoring it. The account needs a real-time "
+                        f"market-data subscription for API use."
+                    )
+                    return
 
             logger.debug(
                 f"Candle | {self.instrument} | "
@@ -358,6 +455,11 @@ class TradingBot:
                     f"State: {session_status['state']} | "
                     f"Trades: {session_status['trades']}"
                 )
+
+        if self._blocked_reason:
+            logger.critical(
+                f"{self.instrument} | TRADING BLOCKED | {self._blocked_reason}"
+            )
 
         if self._open_position:
             pos = self._open_position
@@ -386,13 +488,8 @@ class TradingBot:
             logger.error("IBKR connection test failed")
             return
 
-        # Check for existing position
-        pos = self.client.get_position(self.instrument)
-        if pos:
-            logger.warning(
-                f"Existing position found: {self.instrument} | "
-                f"{pos.units} shares @ {pos.avg_price}"
-            )
+        # Reconcile with whatever the account already holds / has working
+        self._reconcile_on_start()
 
         self._running = True
         last_status_log = datetime.now()
@@ -423,6 +520,7 @@ class TradingBot:
 
                     # Log status periodically
                     if datetime.now() - last_status_log > status_interval:
+                        self._refresh_block()
                         self._log_status()
                         last_status_log = datetime.now()
 
