@@ -33,6 +33,10 @@ rsync -avz --delete \
     --exclude 'trades.db' \
     --exclude 'logs/' \
     --exclude '.git' \
+    --exclude 'cache/' \
+    --exclude 'Evidence/' \
+    --exclude '.claude/' \
+    --exclude '.DS_Store' \
     "$BOT_DIR/" "$SSH_USER@$SERVER:$APP_DIR/"
 
 # Fix ownership
