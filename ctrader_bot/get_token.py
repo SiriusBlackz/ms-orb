@@ -17,6 +17,7 @@ Outputs the token pair and, optionally, your ctidTraderAccountId list.
 
 import json
 import os
+import ssl
 import sys
 import urllib.parse
 import urllib.request
@@ -29,6 +30,25 @@ REDIRECT_URI = "http://localhost/"
 AUTH_URL = "https://id.ctrader.com/my/settings/openapi/grantingaccess/"
 TOKEN_URL = "https://openapi.ctrader.com/apps/token"
 ACCOUNTS_URL = "https://api.spotware.com/connect/tradingaccounts"
+
+# python.org builds on macOS ship without root certificates; use certifi's
+# bundle when it is installed so HTTPS verification works out of the box.
+try:
+    import certifi
+    SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    SSL_CONTEXT = ssl.create_default_context()
+
+
+def extract_code(raw: str) -> str:
+    """Accept either the bare code or the whole redirected URL."""
+    raw = raw.strip()
+    if "code=" in raw:
+        query = urllib.parse.urlparse(raw).query or raw.split("?", 1)[-1]
+        values = urllib.parse.parse_qs(query).get("code")
+        if values:
+            return values[0]
+    return raw
 
 
 def main() -> None:
@@ -45,9 +65,10 @@ def main() -> None:
     print("   grant access to the trading account(s):\n")
     print(f"   {AUTH_URL}?{params}\n")
     print("2. After granting, the browser redirects to localhost (page won't")
-    print("   load — that's fine). Copy the ?code=... value from the URL bar.")
+    print("   load — that's fine). Copy the whole address from the URL bar")
+    print("   (or just the ?code=... value) and paste it below.")
     print("   NOTE: the code expires in ~60 seconds — paste it promptly.\n")
-    code = input("Authorization code: ").strip()
+    code = extract_code(input("Authorization code or redirected URL: "))
 
     query = urllib.parse.urlencode({
         "grant_type": "authorization_code",
@@ -56,7 +77,7 @@ def main() -> None:
         "client_id": client_id,
         "client_secret": client_secret,
     })
-    with urllib.request.urlopen(f"{TOKEN_URL}?{query}") as resp:
+    with urllib.request.urlopen(f"{TOKEN_URL}?{query}", context=SSL_CONTEXT) as resp:
         tokens = json.loads(resp.read())
 
     if "accessToken" not in tokens:
@@ -72,7 +93,7 @@ def main() -> None:
     # Best-effort: list trading accounts so the user can grab ctidTraderAccountId
     try:
         q = urllib.parse.urlencode({"access_token": tokens["accessToken"]})
-        with urllib.request.urlopen(f"{ACCOUNTS_URL}?{q}") as resp:
+        with urllib.request.urlopen(f"{ACCOUNTS_URL}?{q}", context=SSL_CONTEXT) as resp:
             data = json.loads(resp.read())
         print("\nTrading accounts on this token:")
         for acc in data.get("data", []):
