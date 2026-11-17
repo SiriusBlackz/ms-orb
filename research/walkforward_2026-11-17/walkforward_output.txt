@@ -1,0 +1,195 @@
+Loading candles and running Config-A (Tokyo, XAU + NAS100)...
+  fetched 5525 recent XAU_USD candles
+  XAU_USD: 299949 M5 candles 2022-08-25 -> 2026-11-17
+  fetched 5525 recent NAS100_USD candles
+  NAS100_USD: 299388 M5 candles 2022-08-25 -> 2026-11-17
+
+1430 trades, 2022-08-26 -> 2026-11-17
+
+====================================================================================================
+A. BASELINE (no filter) BY YEAR
+====================================================================================================
+  2022 XAU_US n=  58  net    +4.8R  exp +0.083  t +0.32  PF 1.09  WR 36.2%  maxDD  17.8R
+  2022 NAS100 n=  49  net   -14.4R  exp -0.293  t -1.32  PF 0.65  WR 20.4%  maxDD  19.7R
+  2022 ALL    n= 107  net    -9.5R  exp -0.089  t -0.52  PF 0.90  WR 29.0%  maxDD  19.8R
+  2023 XAU_US n= 180  net   -42.2R  exp -0.234  t -1.74  PF 0.76  WR 30.0%  maxDD  58.4R
+  2023 NAS100 n= 130  net    -4.2R  exp -0.032  t -0.21  PF 0.96  WR 30.8%  maxDD  34.1R
+  2023 ALL    n= 310  net   -46.3R  exp -0.149  t -1.49  PF 0.83  WR 30.3%  maxDD  86.3R
+  2024 XAU_US n= 165  net   -66.1R  exp -0.401  t -3.10  PF 0.60  WR 22.4%  maxDD  78.8R
+  2024 NAS100 n= 168  net   +38.5R  exp +0.229  t +1.65  PF 1.33  WR 37.5%  maxDD  12.8R
+  2024 ALL    n= 333  net   -27.6R  exp -0.083  t -0.86  PF 0.90  WR 30.0%  maxDD  51.0R
+  2025 XAU_US n= 185  net   -33.4R  exp -0.181  t -1.44  PF 0.79  WR 23.8%  maxDD  51.5R
+  2025 NAS100 n= 171  net    +9.9R  exp +0.058  t +0.43  PF 1.08  WR 31.0%  maxDD  18.5R
+  2025 ALL    n= 356  net   -23.6R  exp -0.066  t -0.72  PF 0.92  WR 27.2%  maxDD  50.4R
+  2026 XAU_US n= 162  net   +24.4R  exp +0.151  t +1.04  PF 1.20  WR 30.2%  maxDD  32.9R
+  2026 NAS100 n= 162  net   +37.4R  exp +0.231  t +1.59  PF 1.33  WR 33.3%  maxDD  19.4R
+  2026 ALL    n= 324  net   +61.8R  exp +0.191  t +1.87  PF 1.27  WR 31.8%  maxDD  47.3R
+  TOTAL        n=1430  net   -45.2R  exp -0.032  t -0.67  PF 0.96  WR 29.7%  maxDD 140.4R
+
+  Share of trades with cost_r < 0.07, by year (fixed price cost, so this
+  rises mechanically as prices and ATR rise):
+    2022 XAU_US:   0.0% pass   median cost_r 0.360
+    2022 NAS100:  26.5% pass   median cost_r 0.095
+    2023 XAU_US:   0.6% pass   median cost_r 0.385
+    2023 NAS100:   6.9% pass   median cost_r 0.133
+    2024 XAU_US:   0.0% pass   median cost_r 0.283
+    2024 NAS100:  20.2% pass   median cost_r 0.103
+    2025 XAU_US:  24.9% pass   median cost_r 0.120
+    2025 NAS100:  52.0% pass   median cost_r 0.068
+    2026 XAU_US:  55.6% pass   median cost_r 0.064
+    2026 NAS100:  77.8% pass   median cost_r 0.049
+
+====================================================================================================
+B. FROZEN RULES AS DISCOVERED: discovery sample vs data that arrived afterwards
+====================================================================================================
+
+  cost<0.07   (discovered 2026-08-04)
+    discovery sample  filtered: n= 357  net   +71.2R  exp +0.199  t +2.10  PF 1.29  WR 33.6%  maxDD  19.5R
+                      all     : n=1326  net   -56.0R  exp -0.042  t -0.87  PF 0.95  WR 29.7%  maxDD 140.4R
+    AFTER discovery   filtered: n=  51  net    +4.6R  exp +0.091  t +0.36  PF 1.12  WR 29.4%  maxDD   6.7R
+                      all     : n= 104  net   +10.8R  exp +0.104  t +0.58  PF 1.14  WR 29.8%  maxDD  14.9R
+
+  cost<0.07 + noJul   (discovered 2026-08-04)
+    discovery sample  filtered: n= 326  net   +76.7R  exp +0.235  t +2.35  PF 1.35  WR 34.7%  maxDD  17.3R
+                      all     : n=1326  net   -56.0R  exp -0.042  t -0.87  PF 0.95  WR 29.7%  maxDD 140.4R
+    AFTER discovery   filtered: n=  51  net    +4.6R  exp +0.091  t +0.36  PF 1.12  WR 29.4%  maxDD   6.7R
+                      all     : n= 104  net   +10.8R  exp +0.104  t +0.58  PF 1.14  WR 29.8%  maxDD  14.9R
+
+  cost<0.07 + ADX>=20 + noJul   (discovered 2026-08-04)
+    discovery sample  filtered: n= 235  net   +67.0R  exp +0.285  t +2.41  PF 1.43  WR 36.2%  maxDD  23.4R
+                      all     : n=1326  net   -56.0R  exp -0.042  t -0.87  PF 0.95  WR 29.7%  maxDD 140.4R
+    AFTER discovery   filtered: n=  32  net   -15.4R  exp -0.481  t -1.98  PF 0.45  WR 15.6%  maxDD  15.4R
+                      all     : n= 104  net   +10.8R  exp +0.104  t +0.58  PF 1.14  WR 29.8%  maxDD  14.9R
+
+  Mon-Wed only   (discovered 2026-10-21)
+    discovery sample  filtered: n= 840  net    -2.0R  exp -0.002  t -0.04  PF 1.00  WR 30.2%  maxDD 119.1R
+                      all     : n=1402  net   -37.7R  exp -0.027  t -0.57  PF 0.97  WR 29.9%  maxDD 140.4R
+    AFTER discovery   filtered: n=  19  net    -6.1R  exp -0.322  t -0.93  PF 0.61  WR 21.1%  maxDD   6.9R
+                      all     : n=  28  net    -7.5R  exp -0.269  t -0.91  PF 0.68  WR 21.4%  maxDD   9.6R
+
+  NAS only   (discovered 2026-10-21)
+    discovery sample  filtered: n= 666  net   +67.7R  exp +0.102  t +1.48  PF 1.14  WR 32.4%  maxDD  41.7R
+                      all     : n=1402  net   -37.7R  exp -0.027  t -0.57  PF 0.97  WR 29.9%  maxDD 140.4R
+    AFTER discovery   filtered: n=  14  net    -0.4R  exp -0.031  t -0.07  PF 0.96  WR 28.6%  maxDD   5.2R
+                      all     : n=  28  net    -7.5R  exp -0.269  t -0.91  PF 0.68  WR 21.4%  maxDD   9.6R
+
+====================================================================================================
+C. ANCHORED WALK-FORWARD, full grid (216 rules), half-year blocks from 2024-01-01
+   Rule for each block = highest net R on ALL PRIOR trades (min 100 training trades)
+====================================================================================================
+
+  Selection criterion: net R
+  2024-01-01 -> 2024-07-01  train n= 417  rule: ADX>=25 noJul                      | all  -22.7R (n=164)  filtered  -25.6R (n= 79)
+  2024-07-01 -> 2025-01-01  train n= 581  rule: ADX>=20 noJul NASonly              | all   -4.8R (n=169)  filtered   -7.1R (n= 57)
+  2025-01-01 -> 2025-07-01  train n= 750  rule: ADX>=20 noJul NASonly              | all  -35.0R (n=179)  filtered  -14.0R (n= 46)
+  2025-07-01 -> 2026-01-01  train n= 929  rule: noJul NASonly                      | all  +11.4R (n=177)  filtered   +0.5R (n= 73)
+  2026-01-01 -> 2026-07-01  train n=1106  rule: noJul NASonly                      | all  +76.9R (n=177)  filtered  +34.4R (n= 87)
+  2026-07-01 -> 2027-01-01  train n=1283  rule: cost<0.08                          | all  -15.0R (n=147)  filtered  -11.8R (n= 93)
+  OUT-OF-SAMPLE filtered: n= 435  net   -23.6R  exp -0.054  t -0.66  PF 0.93  WR 27.8%  maxDD  57.8R
+  OUT-OF-SAMPLE baseline: n=1013  net   +10.6R  exp +0.010  t +0.19  PF 1.01  WR 29.6%  maxDD  79.5R
+  Permutation p (random same-size subsets do as well): 0.897
+    2024: filtered  -32.7R (n=136)   baseline  -27.6R (n=333)
+    2025: filtered  -13.5R (n=119)   baseline  -23.6R (n=356)
+    2026: filtered  +22.6R (n=180)   baseline  +61.8R (n=324)
+
+  Selection criterion: t-statistic
+  2024-01-01 -> 2024-07-01  train n= 417  rule: ADX>=25 noJul                      | all  -22.7R (n=164)  filtered  -25.6R (n= 79)
+  2024-07-01 -> 2025-01-01  train n= 581  rule: ADX>=20 noJul NASonly              | all   -4.8R (n=169)  filtered   -7.1R (n= 57)
+  2025-01-01 -> 2025-07-01  train n= 750  rule: ADX>=20 noJul NASonly              | all  -35.0R (n=179)  filtered  -14.0R (n= 46)
+  2025-07-01 -> 2026-01-01  train n= 929  rule: cost<0.08 NASonly                  | all  +11.4R (n=177)  filtered   +3.6R (n= 37)
+  2026-01-01 -> 2026-07-01  train n=1106  rule: cost<0.08 NASonly                  | all  +76.9R (n=177)  filtered  +28.2R (n= 78)
+  2026-07-01 -> 2027-01-01  train n=1283  rule: cost<0.07 ADX>=25 Mon-Wed          | all  -15.0R (n=147)  filtered  -13.1R (n= 22)
+  OUT-OF-SAMPLE filtered: n= 319  net   -27.9R  exp -0.088  t -0.93  PF 0.89  WR 27.9%  maxDD  61.2R
+  OUT-OF-SAMPLE baseline: n=1013  net   +10.6R  exp +0.010  t +0.19  PF 1.01  WR 29.6%  maxDD  79.5R
+  Permutation p (random same-size subsets do as well): 0.941
+    2024: filtered  -32.7R (n=136)   baseline  -27.6R (n=333)
+    2025: filtered  -10.4R (n= 83)   baseline  -23.6R (n=356)
+    2026: filtered  +15.1R (n=100)   baseline  +61.8R (n=324)
+
+====================================================================================================
+D. EACH FILTER ON ITS OWN, walk-forward (threshold re-chosen on prior data each block;
+   'no filter' is always an allowed choice)
+====================================================================================================
+
+  cost_r threshold
+    chosen per block: no filter, no filter, cost<0.10, cost<0.08, cost<0.08, cost<0.08
+    OOS filtered: n= 756  net   +29.5R  exp +0.039  t +0.60  PF 1.05  WR 30.7%  maxDD  51.0R
+    OOS baseline: n=1013  net   +10.6R  exp +0.010  t +0.19  PF 1.01  WR 29.6%  maxDD  79.5R   | improvement +18.9R, permutation p 0.233
+
+  D1 ADX minimum
+    chosen per block: ADX>=25, ADX>=20, ADX>=20, ADX>=20, ADX>=20, ADX>=20
+    OOS filtered: n= 636  net    -7.9R  exp -0.012  t -0.18  PF 0.98  WR 28.8%  maxDD  70.3R
+    OOS baseline: n=1013  net   +10.6R  exp +0.010  t +0.19  PF 1.01  WR 29.6%  maxDD  79.5R   | improvement -18.6R, permutation p 0.878
+
+  skip July
+    chosen per block: noJul, noJul, noJul, noJul, noJul, noJul
+    OOS filtered: n= 922  net   +43.2R  exp +0.047  t +0.79  PF 1.06  WR 30.6%  maxDD  74.4R
+    OOS baseline: n=1013  net   +10.6R  exp +0.010  t +0.19  PF 1.01  WR 29.6%  maxDD  79.5R   | improvement +32.6R, permutation p 0.023
+
+  Mon-Wed only
+    chosen per block: Mon-Wed, Mon-Wed, Mon-Wed, Mon-Wed, Mon-Wed, Mon-Wed
+    OOS filtered: n= 610  net   +33.5R  exp +0.055  t +0.76  PF 1.07  WR 30.7%  maxDD  80.2R
+    OOS baseline: n=1013  net   +10.6R  exp +0.010  t +0.19  PF 1.01  WR 29.6%  maxDD  79.5R   | improvement +22.9R, permutation p 0.191
+
+  instrument choice
+    chosen per block: NASonly, NASonly, NASonly, NASonly, NASonly, NASonly
+    OOS filtered: n= 501  net   +85.7R  exp +0.171  t +2.14  PF 1.24  WR 33.9%  maxDD  19.7R
+    OOS baseline: n=1013  net   +10.6R  exp +0.010  t +0.19  PF 1.01  WR 29.6%  maxDD  79.5R   | improvement +75.1R, permutation p 0.002
+
+====================================================================================================
+E. LEAVE-2026-OUT: rule chosen on trades up to 2025-12-31, tested on 2026
+====================================================================================================
+  Training (to end-2025) baseline: n=1106  net  -107.0R  exp -0.097  t -1.84  PF 0.89  WR 29.1%  maxDD 140.4R
+  2026 baseline                  : n= 324  net   +61.8R  exp +0.191  t +1.87  PF 1.27  WR 31.8%  maxDD  47.3R
+
+  Top 8 rules on training data, and how each did in 2026:
+    noJul NASonly                        train  +34.9R (n=480, t +0.91)   2026  +44.1R (n=144, exp +0.306)
+    NASonly                              train  +29.8R (n=518, t +0.75)   2026  +37.4R (n=162, exp +0.231)
+    cost<0.08 NASonly                    train  +29.2R (n=176, t +1.27)   2026  +33.4R (n=140, exp +0.238)
+    cost<0.08                            train  +27.2R (n=231, t +1.03)   2026  +57.1R (n=248, exp +0.230)
+    ADX>=20 noJul NASonly                train  +25.3R (n=299, t +0.84)   2026  +32.6R (n= 91, exp +0.359)
+    cost<0.08 noJul NASonly              train  +24.5R (n=170, t +1.09)   2026  +40.1R (n=122, exp +0.329)
+    cost<0.08 noJul                      train  +22.5R (n=225, t +0.87)   2026  +70.5R (n=220, exp +0.321)
+    cost<0.07 NASonly                    train  +21.7R (n=145, t +1.05)   2026  +36.4R (n=126, exp +0.289)
+
+  Rules with positive training net R: 22 of 75 eligible
+
+  Reverse check - rule chosen on 2026 only, applied to 2022-2025:
+    noJul                                2026  +87.4R   2022-2025  -70.5R (n=1023, exp -0.069)
+    noJul Mon-Wed                        2026  +85.8R   2022-2025  -61.1R (n=601, exp -0.102)
+    cost<0.10 noJul Mon-Wed              2026  +72.3R   2022-2025  -10.3R (n=181, exp -0.057)
+    Mon-Wed                              2026  +72.2R   2022-2025  -80.3R (n=657, exp -0.122)
+
+====================================================================================================
+F. YEAR-BY-YEAR for the main candidate rules (descriptive, in-sample)
+====================================================================================================
+  rule                                   2022     2023     2024     2025     2026    total     n  maxDD
+  no filter                              -9.5    -46.3    -27.6    -23.6    +61.8    -45.2  1430  140.4
+  cost<0.07                              -4.3     -2.0    +17.1     +9.4    +55.6    +75.8   408   26.1
+  cost<0.07 ADX>=20 noJul                -3.4     +0.3    +10.6     -9.9    +54.0    +51.6   267   23.7
+  NASonly                               -14.4     -4.2    +38.5     +9.9    +37.4    +67.2   680   41.7
+  Mon-Wed                               -24.2    -17.4    -36.6     -2.1    +72.2     -8.1   859  119.1
+  noJul Mon-Wed NASonly                 -16.5     -0.1     -4.8     -0.6    +40.2    +18.3   369   35.4
+
+====================================================================================================
+G. NAS100 TOKYO DETAIL (the only leg that survives): gross vs net by year
+====================================================================================================
+  year      n   gross R   cost R    net R  net exp gross exp  Jul net
+  2022     49      -9.4      4.9    -14.4   -0.293    -0.192     +0.0
+  2023    130     +14.5     18.7     -4.2   -0.032    +0.112    -12.1
+  2024    168     +56.4     17.9    +38.5   +0.229    +0.336     +4.4
+  2025    171     +22.8     12.9     +9.9   +0.058    +0.133     +2.6
+  2026    162     +45.8      8.4    +37.4   +0.231    +0.283     -6.8
+  ALL     680    +130.1     62.9    +67.2   +0.099    +0.191    -11.8
+  NAS full sample      : n= 680  net   +67.2R  exp +0.099  t +1.46  PF 1.13  WR 32.4%  maxDD  41.7R
+  NAS full, skip July  : n= 624  net   +79.0R  exp +0.127  t +1.78  PF 1.18  WR 33.2%  maxDD  29.7R
+  NAS since 2024-01    : n= 501  net   +85.7R  exp +0.171  t +2.14  PF 1.24  WR 33.9%  maxDD  19.7R
+  NAS since 2024, noJul: n= 459  net   +85.5R  exp +0.186  t +2.22  PF 1.26  WR 34.4%  maxDD  19.7R
+  XAU full sample      : n= 750  net  -112.5R  exp -0.150  t -2.31  PF 0.83  WR 27.3%  maxDD 171.3R
+  XAU gross by year    : 2022: +26  2023: +31  2024: -19  2025: -9  2026: +35
+  NAS net R if the true cost were a multiple of the assumed 1.5 points:
+    1.0x cost: full sample   +67.2R   since 2024   +85.7R
+    1.5x cost: full sample   +35.8R   since 2024   +66.1R
+    2.0x cost: full sample    +4.3R   since 2024   +46.5R
+
+  Daily trade series written to <dump dir>/
