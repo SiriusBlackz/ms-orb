@@ -201,9 +201,11 @@ class TradeLogger:
         conn.commit()
         conn.close()
 
+        pnl_s = f"{pnl:.2f}" if pnl is not None else "N/A"
+        rr_s = f"{rr_achieved:.2f}" if rr_achieved is not None else "N/A"
         logger.info(
             f"Trade exit logged: id={row_id} exit={exit_price} reason={exit_reason} "
-            f"pnl={pnl:.2f if pnl else 'N/A'} rr={rr_achieved:.2f if rr_achieved else 'N/A'}"
+            f"pnl={pnl_s} rr={rr_s}"
         )
 
     def log_exit_by_trade_id(
