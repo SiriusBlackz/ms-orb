@@ -30,8 +30,27 @@ os.environ["DB_PATH"] = os.path.join(_TMP, "test_trades.db")
 os.environ["LOG_DIR"] = os.path.join(_TMP, "logs")
 os.environ["ENTRY_FILL_TIMEOUT"] = "5"
 os.environ["EXIT_FILL_TIMEOUT"] = "5"
+# Pin the strategy settings before config is imported: whichever test module
+# loads config first fixes them for the whole run, and a local .env must not
+# leak in. Same values as test_session_manager.py.
+os.environ.update(
+    RR_TARGET="3.0",
+    MAX_TRADES_PER_SESSION="1",
+    STOP_MODE="atr",
+    ATR_STOP_MULT="1.5",
+    ATR_PERIOD="14",
+    HTF_ALIGN="true",
+    HTF_EMA_PERIOD="100",
+    FIRST_BREAKOUT_ONLY="true",
+)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# test_session_manager.py replaces ibkr_client with a stub; these tests need
+# the real module (and modules freshly imported against it).
+if not hasattr(sys.modules.get("ibkr_client"), "IB"):
+    for _m in ("ibkr_client", "config", "strategy", "session_manager", "trade_logger", "main"):
+        sys.modules.pop(_m, None)
 
 import ibkr_client as ic  # noqa: E402
 from ibkr_client import IBKRClient  # noqa: E402
